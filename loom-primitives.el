@@ -15,8 +15,9 @@
 
 (require 'cl-lib)
 
-(require 'loom-core)
 (require 'loom-errors)
+(require 'loom-callback) 
+(require 'loom-promise)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Public API: Attaching Callbacks
@@ -62,15 +63,11 @@ Side Effects:
          ;; "closed over" by the lambdas below and will be available when they
          ;; are eventually executed.
          (captured-async-stack loom-current-async-stack))
-    (loom--attach-callbacks
+    (loom-attach-callbacks
      source-promise
      ;; on-resolved handler wrapper
-     (loom--make-internal-callback
-      :type :resolved
-      :source-promise-id source-id
-      :promise-id target-id
-      :handler-fn
-      (lambda (target-promise res)
+     (loom:callback
+      (lambda (target-promise res) 
         (let ((label (format "on-resolved (%S -> %S)" source-id target-id)))
           ;; Rebind the dynamic variable when the async handler runs.
           (cl-letf (((symbol-value 'loom-current-async-stack)
@@ -79,13 +76,12 @@ Side Effects:
                 (loom:resolve target-promise (funcall on-resolved res))
               (error (loom:reject target-promise
                                     (loom:make-error :type :callback-error
-                                                       :cause err))))))))
-     ;; on-rejected handler wrapper
-     (loom--make-internal-callback
-      :type :rejected
+                                                       :cause err)))))))
+      :type :resolved
       :source-promise-id source-id
-      :promise-id target-id
-      :handler-fn
+      :promise-id target-id)
+     ;; on-rejected handler wrapper
+     (loom:callback
       (if on-rejected
           ;; If the user provided an on-rejected handler, wrap it.
           (lambda (target-promise err)
@@ -98,10 +94,13 @@ Side Effects:
                   (error (loom:reject target-promise
                                         (loom:make-error :type :callback-error
                                                            :cause handler-err)))))))
-        ;; **FIX**: If no handler is provided, create a default one
+        ;; If no handler is provided, create a default one
         ;; that propagates the error to the next link in the chain.
         (lambda (target-promise err)
-          (loom:reject target-promise err)))))
+          (loom:reject target-promise err)))
+      :type :rejected
+      :source-promise-id source-id
+      :promise-id target-id))
     new-promise))
 
 ;;;###autoload
@@ -140,21 +139,17 @@ Side Effects:
                        :parent-promise source-promise))
          (source-id (loom-promise-id source-promise))
          (target-id (loom-promise-id new-promise)))
-    (loom--attach-callbacks
+    (loom-attach-callbacks
      source-promise
      ;; on-resolved: A simple pass-through for successful values.
-     (loom--make-internal-callback
+     (loom:callback
+      (lambda (target-promise value) (loom:resolve target-promise value)) 
       :type :resolved
       :source-promise-id source-id
-      :promise-id target-id
-      :handler-fn (lambda (target-promise value) (loom:resolve target-promise value)))
+      :promise-id target-id)
 
      ;; on-rejected: The core logic for catching and handling errors.
-     (loom--make-internal-callback
-      :type :rejected
-      :source-promise-id source-id
-      :promise-id target-id
-      :handler-fn
+     (loom:callback
       (lambda (target-promise err)
         (condition-case handler-err
             ;; --- Main handler logic, now safely wrapped ---
@@ -204,7 +199,10 @@ Side Effects:
           ;; --- Error handling for the handler function itself ---
           (error (loom:reject target-promise
                                 (loom:make-error :type :callback-error
-                                                   :cause handler-err)))))))
+                                                   :cause handler-err)))))
+      :type :rejected
+      :source-promise-id source-id
+      :promise-id target-id))
     new-promise))
 
 (defun loom:finally (promise callback-fn)
@@ -256,51 +254,49 @@ Side Effects:
                            (callback-id (loom-promise-id callback-promise)))
                       ;; 3. We now wait for the callback's promise to settle
                       ;;    before we settle the main `target-promise`.
-                      (loom--attach-callbacks 
+                      (loom-attach-callbacks 
                        callback-promise
                        ;; If the side-effect callback succeeds...
-                       (loom--make-internal-callback
+                       (loom:callback
+                        (lambda (_tp _v) 
+                          ;; ...settle our target promise with the
+                          ;; original promise's outcome.
+                          (if resolve-with-original-p
+                              (loom:resolve target-promise original-outcome)
+                            (loom:reject target-promise original-outcome)))
                         :type :resolved
                         :source-promise-id callback-id
-                        :promise-id target-id
-                        :handler-fn (lambda (_tp _v)
-                                      ;; ...settle our target promise with the
-                                      ;; original promise's outcome.
-                                      (if resolve-with-original-p
-                                          (loom:resolve target-promise original-outcome)
-                                        (loom:reject target-promise original-outcome))))
+                        :promise-id target-id)
                        ;; If the side-effect callback fails...
-                       (loom--make-internal-callback
+                       (loom:callback
+                        (lambda (_tp cb-reason)
+                          ;; ...reject our target promise with the
+                          ;; new error from the callback.
+                          (loom:reject target-promise cb-reason))
                         :type :rejected
                         :source-promise-id callback-id
-                        :promise-id target-id
-                        :handler-fn (lambda (_tp cb-reason)
-                                      ;; ...reject our target promise with the
-                                      ;; new error from the callback.
-                                      (loom:reject target-promise cb-reason)))))
+                        :promise-id target-id)))
                   ;; If the side-effect function itself throws a synchronous error,
                   ;; that error immediately rejects the target promise.
                   (error (loom:reject target-promise (loom:make-error :cause cb-err))))))
       
       ;; Attach the primary handlers to the original source promise.
-      (loom--attach-callbacks
+      (loom-attach-callbacks
        source-promise
        ;; ON-RESOLVED: when the source promise resolves with `value`.
-       (loom--make-internal-callback
+       (loom:callback
+        (lambda (_tp value)
+          (handle-callback value t))
         :type :resolved
-        ;; MODIFIED: Added missing promise IDs for correct execution context.
         :source-promise-id source-id
-        :promise-id target-id
-        :handler-fn (lambda (_tp value) 
-                      (handle-callback value t)))
+        :promise-id target-id)
        ;; ON-REJECTED: when the source promise rejects with `reason`.
-       (loom--make-internal-callback
+       (loom:callback
+        (lambda (_tp reason)
+          (handle-callback reason nil))
         :type :rejected
-        ;; MODIFIED: Added missing promise IDs for correct execution context.
         :source-promise-id source-id
-        :promise-id target-id
-        :handler-fn (lambda (_tp reason) 
-                      (handle-callback reason nil)))))
+        :promise-id target-id)))
     
     target-promise))
     
@@ -333,20 +329,20 @@ Side Effects:
          (new-promise (loom:promise
                        :name (format "tap-%S" (loom-promise-id source-promise))
                        :parent-promise source-promise)))
-    (loom--attach-callbacks
+    (loom-attach-callbacks
      source-promise
      ;; on-resolved: run callback, then pass original value through.
-     (loom--make-internal-callback
-      :type :resolved
-      :handler-fn (lambda (_ value)
-                    (condition-case nil (funcall callback-fn value nil) (error nil))
-                    (loom:resolve new-promise value)))
+     (loom:callback
+      (lambda (_ value)
+        (condition-case nil (funcall callback-fn value nil) (error nil))
+        (loom:resolve new-promise value))
+      :type :resolved)
      ;; on-rejected: run callback, then re-throw original error.
-     (loom--make-internal-callback
-      :type :rejected
-      :handler-fn (lambda (_ error)
-                    (condition-case nil (funcall callback-fn nil error) (error nil))
-                    (loom:reject new-promise error))))
+     (loom:callback
+      (lambda (_ error)
+        (condition-case nil (funcall callback-fn nil error) (error nil))
+        (loom:reject new-promise error))
+      :type :rejected))
     new-promise))
 
 (provide 'loom-primitives)

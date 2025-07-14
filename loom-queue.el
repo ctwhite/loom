@@ -15,12 +15,12 @@
 
 (require 'cl-lib)
 
+(require 'loom-log)
 (require 'loom-errors)
 (require 'loom-lock)
-(require 'loom-log)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Errors
+;;; Error Definitions
 
 (define-error 'loom-queue-error
   "A generic error related to a `loom-queue`."
@@ -31,7 +31,7 @@
   'loom-queue-error)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Data Structures
+;;; Struct Definitions
 
 (cl-defstruct (loom-queue-node (:constructor %%make-queue-node))
   "Represents a single node in the queue's internal linked list.

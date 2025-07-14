@@ -22,8 +22,8 @@
 
 (require 'cl-lib)
 
-(require 'loom-core)
 (require 'loom-errors)
+(require 'loom-promise)
 (require 'loom-primitives)
 (require 'loom-cancel)
 

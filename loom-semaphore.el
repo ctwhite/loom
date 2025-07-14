@@ -51,16 +51,16 @@
 (require 'cl-lib)
 (require 'subr-x)
 
-(require 'loom-cancel)
-(require 'loom-core)
+(require 'loom-log)
 (require 'loom-errors)
 (require 'loom-lock)
-(require 'loom-log)
-(require 'loom-primitives)
 (require 'loom-queue)
+(require 'loom-promise)
+(require 'loom-primitives)
+(require 'loom-cancel)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Errors
+;;; Error Definitions
 
 (define-error 'loom-semaphore-error
   "A generic error related to a `loom-semaphore`."
@@ -85,14 +85,11 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Constants
 
-(defconst loom--semaphore-max-permits 10000
+(defconst *loom-semaphore-max-permits* 10000
   "Maximum number of permits allowed in a semaphore.")
 
-(defconst loom--semaphore-default-timeout 30.0
-  "Default timeout for semaphore operations in seconds.")
-
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Data Structures
+;;; Struct Definitions
 
 (cl-defstruct (loom-semaphore (:constructor %%make-semaphore))
   "A semaphore for controlling access to a finite number of resources.
@@ -154,10 +151,10 @@ Arguments:
 Arguments:
 - `N` (integer): The permit count to validate.
 - `FUNCTION-NAME` (symbol): The calling function's name for error reporting."
-  (unless (and (integerp n) (> n 0) (<= n loom--semaphore-max-permits))
+  (unless (and (integerp n) (> n 0) (<= n *loom-semaphore-max-permits*))
     (signal 'loom-semaphore-permit-error
             (list (format "%s: Invalid permit count %S (must be 1-%d)" 
-                          function-name n loom--semaphore-max-permits)))))
+                          function-name n *loom-semaphore-max-permits*)))))
 
 (defun loom--update-semaphore-stats (sem acquired released)
   "Update semaphore statistics.
@@ -196,7 +193,7 @@ Arguments:
 
 Arguments:
 - `N` (integer): The initial (and maximum) number of available slots. Must
-  be a positive integer not exceeding `loom--semaphore-max-permits`.
+  be a positive integer not exceeding `*loom-semaphore-max-permits*`.
 - `NAME` (string, optional): A descriptive name for debugging.
 - `:FAIR-P` (boolean, optional): Whether to use fair scheduling (FIFO).
   Defaults to `t`.

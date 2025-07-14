@@ -34,12 +34,12 @@
 
 (require 'cl-lib)
 
-(require 'loom-core)
+(require 'loom-log)
 (require 'loom-errors)
 (require 'loom-lock)
-(require 'loom-log)
-(require 'loom-primitives)
 (require 'loom-queue)
+(require 'loom-promise)
+(require 'loom-primitives)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Errors

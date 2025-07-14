@@ -32,7 +32,7 @@
 (require 'loom-priority-queue)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Errors
+;;; Error Definitions
 
 (define-error 'loom-scheduler-error
   "A generic error related to a `loom-scheduler`."
@@ -66,7 +66,7 @@
   :group 'loom)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Data Structures
+;;; Struct Definitions
 
 (cl-defstruct (loom-scheduler (:constructor %%make-scheduler) (:copier nil))
   "A generalized, prioritized task scheduler for deferred execution.

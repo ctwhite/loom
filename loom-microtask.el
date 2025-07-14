@@ -25,16 +25,11 @@
 
 (require 'cl-lib)
 
-(require 'loom-lock)
 (require 'loom-log)
-(require 'loom-queue)
 (require 'loom-errors)
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Forward Declarations
-
-(declare-function loom-callback-p "loom-core") 
-(declare-function loom:callback "loom-core") 
+(require 'loom-callback)
+(require 'loom-lock)
+(require 'loom-queue)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Error Definitions
@@ -289,12 +284,11 @@ Signals:
      ((functionp cb-or-fn)
       ;; If it's a function, create a loom-callback from it.
       (setq final-callback (loom:callback
-                            :type (or type :deferred) ; Default to :deferred if not specified
-                            :handler-fn cb-or-fn
-                            :priority (or priority 0) ; Microtasks usually have higher priority (lower value)
+                             cb-or-fn
+                            :type (or type :deferred) 
+                            :priority (or priority 0) 
                             :data data)))
      (t
-      ;; Signal an error if the argument is neither a function nor a loom-callback.
       (signal 'wrong-type-argument (list 'function-or-loom-callback-p cb-or-fn))))
 
     ;; Schedule the single, now-guaranteed-to-be-a-loom-callback.
@@ -319,18 +313,18 @@ Returns:
 Side Effects:
 - Executes all pending microtasks in the queue.
 - Resets the `drain-scheduled-p` flag once the queue is empty."
-  (interactive) ; Allow calling directly
+  (interactive) 
   (let ((drained-p nil))
     (loom:with-mutex! (loom-microtask-queue-lock microtask-queue)
       (unless (loom-microtask-queue-drain-scheduled-p microtask-queue)
         (setf (loom-microtask-queue-drain-scheduled-p microtask-queue) t)
-        (setq drained-p t))) ; Mark that we are initiating the drain
+        (setq drained-p t)))
 
     (when drained-p
       (loom-log :debug (loom-microtask-queue-lock microtask-queue)
                   "Public drain call: Initiating microtask queue drain.")
       (loom--drain-microtask-queue microtask-queue))
-    drained-p)) ; Return whether we actually initiated a drain
+    drained-p)) 
 
 (provide 'loom-microtask)
 ;;; loom-microtask.el ends here

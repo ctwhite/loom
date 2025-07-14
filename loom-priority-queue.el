@@ -17,12 +17,12 @@
 
 (require 'cl-lib)
 
+(require 'loom-log)
 (require 'loom-errors)
 (require 'loom-lock)
-(require 'loom-log)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Errors
+;;; Error Definitions
 
 (define-error 'loom-priority-queue-error
   "A generic error related to a priority queue."
@@ -33,7 +33,7 @@
   'loom-priority-queue-error)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Data Structures
+;;; Struct Definitions
 
 (cl-defstruct (loom-priority-queue (:constructor %%make-priority-queue))
   "A binary heap-based, thread-safe priority queue.

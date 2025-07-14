@@ -27,12 +27,12 @@
 (require 'cl-lib)
 
 (require 'loom-errors)
-(require 'loom-core)
+(require 'loom-promise)
 (require 'loom-primitives)
 (require 'loom-combinators)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Errors
+;;; Errors Definitions
 
 (define-error 'loom-flow-timeout-error
   "Operation timed out." 

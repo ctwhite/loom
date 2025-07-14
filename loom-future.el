@@ -24,14 +24,14 @@
 
 (require 'cl-lib)
 
-(require 'loom-core)
+(require 'loom-log)
 (require 'loom-errors)
 (require 'loom-lock)
-(require 'loom-log)
+(require 'loom-promise)
 (require 'loom-primitives)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Errors
+;;; Error Definitions
 
 (define-error 'loom-future-error
   "A generic error related to a `loom-future`."
@@ -42,12 +42,13 @@
   'loom-future-error)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Data Structures
+;;; Struct Definitions
 
 (cl-defstruct (loom-future (:constructor %%make-future))
   "A lazy future representing a deferred computation.
 
 Fields:
+- `id` (symbol): A unique identifier (`gensym`) for logging and debugging. NEW
 - `promise` (loom-promise or nil): The cached promise, which is created
   and stored on the first call to `loom:force`. Initially `nil`.
 - `thunk` (function): A zero-argument closure that, when called, performs
@@ -57,6 +58,7 @@ Fields:
   promise that will be created by this future.
 - `lock` (loom-lock): A mutex that ensures the process of forcing the
   future is atomic and thread-safe."
+  (id nil :type symbol) 
   (promise nil :type (or null loom-promise))
   (thunk (lambda () (error "Empty future thunk")) :type function)
   (evaluated-p nil :type boolean)
@@ -81,7 +83,7 @@ Arguments:
 ;;; Public API: Creation & Forcing
 
 ;;;###autoload
-(cl-defmacro loom:future (thunk-form &key (mode :deferred))
+(cl-defmacro loom:future (thunk-form &key (mode :deferred) id)
   "Create a `loom-future` from a `THUNK-FORM`.
 
 The returned future represents a computation that is performed lazily
@@ -95,6 +97,8 @@ Arguments:
   normal value or another awaitable object (like a promise).
 - `:MODE` (symbol, optional): The concurrency mode (`:deferred` or `:thread`)
   for the promise created when this future is forced. Defaults to `:deferred`.
+- `:ID` (symbol, optional): A unique identifier for the future. If `nil`,
+  a `gensym` is used.
 
 Returns:
 - (loom-future): A new `loom-future` object.
@@ -107,10 +111,11 @@ Side Effects:
 - Creates a new `loom-future` struct.
 - Initializes an internal `loom-lock`."
   (declare (indent 1) (debug t))
-  `(let ((id (gensym "future-")))
-     (loom-log-trace id "Creating new future with mode: %S" ,mode)
+  `(let ((future-id (or ,id (gensym "future-")))) 
+     (loom-log-trace future-id "Creating new future with mode: %S" ,mode)
      (%%make-future
-      :lock (loom:lock (format "future-lock-%S" id) :mode ,mode)
+      :id future-id 
+      :lock (loom:lock (format "future-lock-%S" future-id) :mode ,mode)
       :mode ,mode
       :thunk ,thunk-form)))
 
@@ -140,7 +145,7 @@ Side Effects:
 - Creates an internal `loom-promise` (on first call).
 - Acquires and releases `loom-lock` instances for thread-safe access."
   (loom--validate-future future 'loom:force)
-  (let ((future-id (object-hash future))) ; Using object-hash as a unique ID for logging
+  (let ((future-id (loom-future-id future))) 
     (loom-log-debug future-id "Attempting to force future %S" future)
 
     ;; Fast path: If already evaluated, just return the cached promise.
@@ -164,7 +169,7 @@ Side Effects:
           (setq thunk-to-run (loom-future-thunk future))
           (setq promise-to-return
                 (loom:promise :mode (loom-future-mode future)
-                              :name (format "future-promise-%S" future-id)))
+                              :name (format "future-promise-%S" future-id))) 
           (setf (loom-future-promise future) promise-to-return)))
 
       ;; Run the expensive thunk *outside* the lock to avoid blocking other
@@ -208,7 +213,7 @@ Side Effects:
   and modify its internal state.
 - Calls `loom:await`, which blocks the current thread until the promise settles."
   (loom--validate-future future 'loom:future-get)
-  (let ((future-id (object-hash future)))
+  (let ((future-id (loom-future-id future))) 
     (loom-log-debug future-id "Calling future-get for future %S (timeout: %S)"
                     future timeout)
     (unwind-protect
@@ -219,7 +224,7 @@ Side Effects:
 ;;; Public API: Convenience Constructors
 
 ;;;###autoload
-(cl-defmacro loom:future-resolved! (value-form &key (mode :deferred))
+(cl-defmacro loom:future-resolved! (value-form &key (mode :deferred) id)
   "Return a new `loom-future` that is already resolved with `VALUE-FORM`.
 This future is created in an 'already forced' state. Forcing it will not
 trigger any new computation.
@@ -228,6 +233,8 @@ Arguments:
 - `VALUE-FORM` (form): A Lisp form that evaluates to the value for the
   pre-resolved future.
 - `:MODE` (symbol, optional): Concurrency mode for the future's promise.
+- `:ID` (symbol, optional): A unique identifier for the future. If `nil`,
+  a `gensym` is used.
 
 Returns:
 - (loom-future): A new, already-evaluated future.
@@ -243,14 +250,15 @@ Side Effects:
   (declare (indent 1) (debug t))
   `(let* ((val ,value-form)
           (promise (loom:resolved! val :mode ,mode))
-          (id (gensym "resolved-future-")))
-     (loom-log-trace id "Creating pre-resolved future with value: %S" val)
-     (%%make-future :promise promise :evaluated-p t :mode ,mode
-                    :lock (loom:lock (format "future-resolved-lock-%S" id)
+          (future-id (or ,id (gensym "resolved-future-"))))
+     (loom-log-trace future-id "Creating pre-resolved future with value: %S" val)
+     (%%make-future :id future-id
+                    :promise promise :evaluated-p t :mode ,mode
+                    :lock (loom:lock (format "future-resolved-lock-%S" future-id)
                                      :mode ,mode))))
 
 ;;;###autoload
-(cl-defmacro loom:future-rejected! (error-form &key (mode :deferred))
+(cl-defmacro loom:future-rejected! (error-form &key (mode :deferred) id)
   "Return a new `loom-future` that is already rejected with `ERROR-FORM`.
 This future is created in an 'already forced' state.
 
@@ -258,6 +266,8 @@ Arguments:
 - `ERROR-FORM` (form): A Lisp form that evaluates to the error for the
   pre-rejected future.
 - `:MODE` (symbol, optional): Concurrency mode for the future's promise.
+- `:ID` (symbol, optional): A unique identifier for the future. If `nil`,
+  a `gensym` is used.
 
 Returns:
 - (loom-future): A new, already-evaluated future.
@@ -273,14 +283,15 @@ Side Effects:
   (declare (indent 1) (debug t))
   `(let* ((err ,error-form)
           (promise (loom:rejected! err :mode ,mode))
-          (id (gensym "rejected-future-")))
-     (loom-log-trace id "Creating pre-rejected future with error: %S" err)
-     (%%make-future :promise promise :evaluated-p t :mode ,mode
-                    :lock (loom:lock (format "future-rejected-lock-%S" id)
+          (future-id (or ,id (gensym "rejected-future-")))) 
+     (loom-log-trace future-id "Creating pre-rejected future with error: %S" err)
+     (%%make-future :id future-id ; Assign the new ID
+                    :promise promise :evaluated-p t :mode ,mode
+                    :lock (loom:lock (format "future-rejected-lock-%S" future-id)
                                      :mode ,mode))))
 
 ;;;###autoload
-(cl-defun loom:future-delay (seconds &optional value &key (mode :deferred))
+(cl-defun loom:future-delay (seconds &optional value &key (mode :deferred) id)
   "Create a `loom-future` that resolves with `VALUE` after `SECONDS`.
 The timer for the delay only starts when the future is first forced via
 `loom:force`.
@@ -289,6 +300,8 @@ Arguments:
 - `SECONDS` (number): The non-negative delay duration.
 - `VALUE` (any, optional): The value to resolve with. Defaults to `t`.
 - `:MODE` (symbol, optional): The concurrency mode for the future's promise.
+- `:ID` (symbol, optional): A unique identifier for the future. If `nil`,
+  a `gensym` is used.
 
 Returns:
 - (loom-future): A new, lazy future.
@@ -305,7 +318,7 @@ Side Effects:
     (error "SECONDS must be a non-negative number: %S" seconds))
   (loom-log-trace nil "Creating delay future for %S seconds with value: %S"
                   seconds value)
-  (loom:future (lambda () (loom:delay seconds value)) :mode mode))
+  (loom:future (lambda () (loom:delay seconds value)) :mode mode :id id))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Public API: Chaining & Composition
@@ -344,6 +357,7 @@ Side Effects:
         (lambda ()
           (loom-log-debug id "Forcing parent future for future-then chain")
           (loom:then (loom:force parent-future) ,transform-fn))
+        :id id 
         :mode (loom-future-mode parent-future)))))
 
 ;;;###autoload
@@ -380,6 +394,7 @@ Side Effects:
           (loom-log-debug id "Forcing parent future for future-catch chain")
           (loom:catch (loom:force parent-future)
                       ,error-handler-fn))
+        :id id 
         :mode (loom-future-mode parent-future)))))
 
 ;;;###autoload
@@ -406,11 +421,14 @@ Side Effects:
   (unless (listp futures)
     (loom-log-error nil "`FUTURES` must be a list: %S" futures)
     (error "`FUTURES` must be a list: %S" futures))
-  (loom-log-trace nil "Creating future-all for %d futures" (length futures))
-  (loom:future
-   (lambda ()
-     (loom-log-debug nil "Forcing all child futures for future-all")
-     (loom:all (mapcar #'loom:force futures)))))
+  (let ((id (gensym "future-all-"))) ; Generate ID for future-all
+    (loom-log-trace id "Creating future-all for %d futures" (length futures))
+    (loom:future
+     (lambda ()
+       (loom-log-debug id "Forcing all child futures for future-all")
+       (loom:all (mapcar #'loom:force futures)))
+     :id id 
+     :mode (cl-some (lambda (f) (when (loom-future-p f) (loom-future-mode f))) futures)))) ; Infer mode from children
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Public API: Introspection
@@ -435,7 +453,7 @@ Signals:
                    :promise-status ,(when promise (loom:status promise))
                    :promise-value ,(when promise (loom:value promise))
                    :promise-error ,(when promise (loom:error-value promise)))))
-    (loom-log-trace (object-hash future) "Getting status for future: %S" status)
+    (loom-log-trace (loom-future-id future) "Getting status for future: %S" status)
     status))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -460,7 +478,7 @@ Side Effects:
 - Calls `loom:force` if `AWAITABLE` is a `loom-future`, which may execute
   the future's thunk and modify its internal state."
   (if (loom-future-p awaitable)
-      (let ((future-id (object-hash awaitable)))
+      (let ((future-id (loom-future-id awaitable))) 
         (loom-log-debug future-id "Normalizing future %S into a promise" awaitable)
         (loom:force awaitable))
     nil))

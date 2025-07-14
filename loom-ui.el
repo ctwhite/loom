@@ -12,12 +12,12 @@
 ;;; Code:
 
 (require 'tabulated-list)
-(require 's)       ;; For s-blank?, s-join, s-chop-prefix
-(require 'cl-lib)  ;; For cl-loop, plist-put, plist-remq, when-let
-(require 'pp)      ;; For pretty-printing complex values in inspection buffer
+(require 's)       
+(require 'cl-lib)  
+(require 'pp)      
 
 (require 'loom-cancel)
-(require 'loom-core)
+(require 'loom-promise)
 (require 'loom-registry)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;

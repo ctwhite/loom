@@ -53,6 +53,7 @@
 ;; Foundational Data Structures
 (require 'loom-log)
 (require 'loom-errors)
+(require 'loom-callback)
 (require 'loom-lock)
 (require 'loom-queue)
 (require 'loom-priority-queue)
@@ -61,7 +62,8 @@
 (require 'loom-microtask)
 (require 'loom-scheduler)
 (require 'loom-registry)
-(require 'loom-core)
+(require 'loom-config)
+(require 'loom-promise)
 (require 'loom-primitives)
 (require 'loom-cancel)
 

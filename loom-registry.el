@@ -39,17 +39,17 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Forward Declarations
 
-(declare-function loom-promise-p "loom-core")
-(declare-function loom-promise-id "loom-core")
-(declare-function loom-promise-state "loom-core")
-(declare-function loom-promise-created-at "loom-core")
-(declare-function loom:status "loom-core")
-(declare-function loom:pending-p "loom-core")
-(declare-function loom:format-promise "loom-core")
-(declare-function loom:reject "loom-core")
+(declare-function loom-promise-p "loom-promise")
+(declare-function loom-promise-id "loom-promise")
+(declare-function loom-promise-state "loom-promise")
+(declare-function loom-promise-created-at "loom-promise")
+(declare-function loom:status "loom-promise")
+(declare-function loom:pending-p "loom-promise")
+(declare-function loom:format-promise "loom-promise")
+(declare-function loom:reject "loom-promise")
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Errors
+;;; Error Definitions
 
 (define-error 'loom-registry-error
   "A generic error related to the promise registry."
@@ -81,7 +81,7 @@ time) are evicted, prioritizing settled promises first."
   :group 'loom)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Data Structures & Internal State
+;;; Internal State
 
 (defvar loom-resource-tracking-function nil
   "A function called by primitives when a resource is acquired or released.
@@ -90,6 +90,9 @@ The function should accept two arguments: `ACTION` (a keyword like
 This is intended to be dynamically bound by a higher-level library
 (e.g., a promise executor) to associate resource management with a
 specific task.")
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Struct Definitions
 
 (cl-defstruct (loom-promise-meta (:constructor %%make-promise-meta))
   "Metadata for a promise in the global registry.

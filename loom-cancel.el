@@ -12,13 +12,14 @@
 (require 'cl-lib)
 
 (require 'loom-log)
+(require 'loom-callback)
 (require 'loom-lock)
-(require 'loom-core)
-(require 'loom-primitives)
 (require 'loom-microtask)
+(require 'loom-promise)
+(require 'loom-primitives)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Errors
+;;; Error Definitions
 
 (define-error 'loom-cancel-error
   "A promise or task was cancelled."
@@ -29,7 +30,7 @@
   'loom-type-error)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Data Structures
+;;; Struct Definitions
 
 (cl-defstruct (loom-cancel-token (:constructor %%make-cancel-token))
   "A thread-safe token for signaling cancellation to asynchronous operations.
@@ -186,16 +187,15 @@ Side Effects:
               (lambda (registered-cb)
                 (let ((handler (loom-callback-handler-fn registered-cb)))
                   (loom:callback
-                   :type :deferred
-                   :priority 0
-                   :handler-fn
-                   (lambda ()
+                   (lambda () 
                      (condition-case err
                          (funcall handler cancellation-error)
                        (error
                         (loom-log :error nil
                                   "Cancellation callback failed for token %S: %S"
-                                  (loom-cancel-token-name token) err)))))))
+                                  (loom-cancel-token-name token) err))))
+                   :type :deferred
+                   :priority 0))) 
               registrations-to-run)))
         (when tasks-to-run
           (loom:schedule-microtasks loom--microtask-scheduler tasks-to-run))))
@@ -232,18 +232,18 @@ Side Effects:
       (loom:schedule-microtasks
        loom--microtask-scheduler
        (list (loom:callback 
+               (lambda () (funcall callback reason)) 
                :type :deferred 
-               :priority 0
-               :handler-fn (lambda () (funcall callback reason)))))
+               :priority 0))) 
     (loom:with-mutex! (loom-cancel-token-lock token)
       (if-let ((reason-in-lock (loom:cancel-token-reason token)))
           (loom:schedule-microtasks
            loom--microtask-scheduler
            (list (loom:callback
+                  (lambda () (funcall callback reason-in-lock)) 
                   :type :deferred 
-                  :priority 0
-                  :handler-fn (lambda () (funcall callback reason-in-lock)))))
-        (let ((reg (loom:callback :type :cancel :handler-fn callback)))
+                  :priority 0))) 
+        (let ((reg (loom:callback callback :type :cancel))) 
           (cl-pushnew reg (loom-cancel-token-registrations token)
                       :key #'loom-callback-handler-fn
                       :test #'eq)))))

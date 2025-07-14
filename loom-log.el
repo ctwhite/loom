@@ -23,7 +23,7 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Customization
 
-(defcustom loom-log-enabled-p nil
+(defcustom loom-log-enabled-p t
   "If non-nil, enable logging messages from the Loom library.
 When nil, `loom-log' will do nothing."
   :type 'boolean

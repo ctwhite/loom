@@ -25,7 +25,8 @@
 (require 'loom-registry)
 (require 'loom-microtask)
 (require 'loom-scheduler)
-(require 'loom-core)
+(require 'loom-config)
+(require 'loom-promise)
 (require 'loom-primitives)
 (require 'loom-combinators)
 (require 'loom-cancel)
@@ -349,7 +350,7 @@ Sets up and tears down schedulers for test isolation."
 
 (ert-deftest loom-core-callback-constructor-test ()
   "Test the `loom:callback` constructor."
-  (let ((cb (loom:callback :type :test :handler-fn #'identity)))
+  (let ((cb (loom:callback  #'identity :type :test)))
     (should (loom-callback-p cb))
     (should (eq :test (loom-callback-type cb)))
     (should (functionp (loom-callback-handler-fn cb)))
@@ -568,8 +569,9 @@ Sets up and tears down schedulers for test isolation."
            (p-outer (loom:promise)))
       (loom:resolve p-outer p-inner)
       (let* ((result (loom-test-await p-outer))
-             (err (cadr result)))
-        (should (string= "inner error" (loom:error-message (cadr err))))))))
+             (err (cadr result)))i
+             (message "-----------------------------> %s %s" result err)
+        (should (string= "inner error" (loom:error-message (caadr err))))))))
 
 (ert-deftest loom-promise-handler-errors-test ()
   "Test when a promise handler itself throws an error."
@@ -698,13 +700,21 @@ Sets up and tears down schedulers for test isolation."
 (ert-deftest loom-any-test ()
   "Test `loom:any` for the first fulfillment, or aggregate rejection."
   (with-test-schedulers
+    ;; Test case 1: First promise rejects, second resolves
     (let ((p (loom:any (list (loom:rejected! "e1")
                              (loom:delay 0.01 "ok")))))
       (should (equal "ok" (loom-test-await p))))
+
+    ;; Test case 2: All promises reject
     (let* ((p (loom:any (list (loom:rejected! "e1")
-                             (loom:rejected! "e2"))))
-           (result (loom-test-await p))
+                              (loom:rejected! "e2"))))
+           (result (condition-case err-sym
+                       (loom-test-await p)
+                     (error err-sym)))
+           ;; `err` is `(cadr result)`, which is the list `(ACTUAL-LOOM-ERROR-STRUCT)`.
            (err (cadr result)))
+
+      ;; The aggregate error is the :cause of this `ACTUAL-LOOM-ERROR-STRUCT`.
       (should (eq :aggregate-error (loom-error-type (cadr err)))))))
 
 (ert-deftest loom-all-settled-test ()
@@ -766,27 +776,45 @@ Sets up and tears down schedulers for test isolation."
 (ert-deftest loom-any-mixed-success-rejection-test ()
   "Test `loom:any` with mixed successes and rejections."
   (with-test-schedulers
-    ;; --- Test Case 1: First resolving promise wins ---
-    (let ((p (loom:any (list (loom:rejected! "e1")
-                             (loom:delay 0.02 "s1")
-                             (loom:rejected! "e2")
-                             (loom:delay 0.01 "s2")))))
-      ;; This part is correct: s2 resolves fastest.
-      (should (equal "s2" (loom-test-await p))))
+    ;; Helper function to create a promise that rejects after a delay
+    (cl-flet ((loom-test-delayed-rejected (delay-seconds error-value)
+                (loom:promise
+                 :name (format "delayed-rejected-%.2fs-%S" delay-seconds error-value)
+                 :executor (lambda (_resolve reject)
+                             (run-at-time delay-seconds nil
+                                          (lambda ()
+                                            (funcall reject (loom:make-error :message error-value))))))))
 
-    ;; --- Test Case 2: All promises reject ---
-    (let* ((p (loom:any (list (loom:delay 0.02 (loom:rejected! "e1"))
-                              (loom:delay 0.01 (loom:rejected! "e2")))))
-           (result (loom-test-await p))
-           (await-condition (cadr result))
-           ;; This is the actual :aggregate-error object.
-           (agg-error (cadr await-condition)))
+      ;; --- Test Case 1: First resolving promise wins ---
+      (let ((p (loom:any (list (loom:rejected! "e1")
+                               (loom:delay 0.02 "s1")
+                               (loom:rejected! "e2")
+                               (loom:delay 0.01 "s2")))))
+        ;; This part is correct: s2 resolves fastest.
+        (should (equal "s2" (loom-test-await p))))
 
-      ;; 1. Check that the error has the correct type.
-      (should (eq :aggregate-error (loom-error-type agg-error)))
+      ;; --- Test Case 2: All promises reject ---
+      (let* ((p (loom:any (list (loom-test-delayed-rejected 0.02 "e1") ; Use helper for direct rejection
+                                (loom-test-delayed-rejected 0.01 "e2")))) ; Use helper for direct rejection
+             ;; `loom-test-await` is assumed to wrap `loom:await`.
+             ;; `loom:await` signals `(loom-await-error ACTUAL-LOOM-ERROR-STRUCT)`.
+             ;; `condition-case` catches this as `(error-symbol (error-data))`.
+             ;; So, `result` will be `(error (loom-await-error ACTUAL-LOOM-ERROR-STRUCT))`.
+             (result (condition-case err-sym
+                         (loom-test-await p)
+                       (error err-sym)))
+             ;; `await-condition` is `(cadr result)`, which is the list `(loom-await-error ACTUAL-LOOM-ERROR-STRUCT)`.
+             (await-condition (cadr result))
+             ;; `agg-error` is `(cadr await-condition)`, which is the ACTUAL-LOOM-ERROR-STRUCT.
+             (agg-error (cadr await-condition)))
 
-      ;; 2. Use `loom:error-cause` to get the list of underlying errors.
-      (should (= 2 (length (loom:error-cause agg-error)))))))
+        ;; (message "any test result TC2 --------------> %S %S %S" result await-condition agg-error)
+
+        ;; 1. Check that the error has the correct type.
+        (should (eq :aggregate-error (loom-error-type agg-error)))
+
+        ;; 2. Use `loom:error-cause` to get the list of underlying errors.
+        (should (= 2 (length (loom:error-cause agg-error))))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Test Suite: loom-registry.el
