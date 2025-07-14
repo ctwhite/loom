@@ -47,7 +47,7 @@ Loom.el can be installed via your preferred Emacs package manager.
 ### straight.el
 
 ```elisp
-(straight-use-package '(loom :type git :host github :repo "ctwhite/loom.el"))
+(straight-use-package '(loom :type git :host github :repo "ctwhite/loom"))
 
 ```
 
