@@ -216,9 +216,11 @@
             (list (if (fboundp 'loom:make-error)
                       (loom:make-error
                        :type :loom-invalid-lock-error
-                       :message (format "%S: Invalid lock object" function-name)
+                       :message (format "%S: Invalid lock object"
+                                        function-name)
                        :data `(:lock ,lock :function ,function-name))
-                    (format "%S: Invalid lock object: %S" function-name lock))))))
+                    (format "%S: Invalid lock object: %S"
+                            function-name lock))))))
 
 (defun loom--validate-lock-mode (mode)
   "Validate MODE is a supported lock mode."
@@ -237,8 +239,8 @@
 
 (defun loom--lock-get-effective-owner (lock &optional owner)
   "Return the effective owner for a lock operation.
-  Defaults to `current-thread` for `:thread` mode or `t` for cooperative
-  modes (representing the main Emacs process/thread)."
+  Defaults to `current-thread` for `:thread` mode or `t` for
+  cooperative modes (representing the main Emacs process/thread)."
   (or owner
       (pcase (loom-lock-mode lock)
         (:thread (if (fboundp 'current-thread)
@@ -272,7 +274,8 @@
   "Perform basic deadlock detection for LOCK and OWNER.
   Signals `loom-lock-deadlock-error` if a potential deadlock is found."
   (when loom-lock-enable-deadlock-detection
-    ;; Simple check: if owner is already in the lock's owner-stack, it's a cycle.
+    ;; Simple check: if owner is already in the lock's owner-stack, it's a
+    ;; cycle.
     (when (memq owner (loom-lock-owner-stack lock))
       (loom--lock-signal-error
        'loom-lock-deadlock-error
@@ -288,7 +291,8 @@
     (condition-case err
         (funcall (symbol-value 'loom-resource-tracking-function) action lock)
       (error
-       (loom-log :warn (loom-lock-name lock) "Resource tracking failed: %S" err)))))
+       (loom-log :warn (loom-lock-name lock) "Resource tracking failed: %S"
+                 err)))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Core Lock Operations (Internal Helpers)
@@ -329,9 +333,9 @@
         (cl-incf (loom-lock-contention-count lock))
         (loom--lock-update-stats lock :contention)
         (when timeout
-          (sit-for (min sleep-interval (- timeout (- (float-time) start-time))))
-          (setq sleep-interval (min (* sleep-interval 1.5) 0.1)))))) ; Exponential backoff.
-
+          (sit-for (min sleep-interval
+                        (- timeout (- (float-time) start-time))))
+          (setq sleep-interval (min (* sleep-interval 1.5) 0.1))))))
     ;; Check if we timed out.
     (unless acquired-p
       (loom--lock-update-stats lock :timeout)
@@ -340,7 +344,6 @@
        (format "Lock acquisition timed out after %s seconds" timeout)
        lock
        `(:timeout ,timeout :owner ,owner)))
-
     ;; Update statistics and track resource if acquired.
     (when acquired-p
       (let ((wait-time (- (float-time) start-time)))
@@ -348,7 +351,6 @@
               (max (loom-lock-max-wait-time lock) wait-time))
         (loom--lock-update-stats lock :acquisition)
         (loom--lock-track-resource :acquire lock)))
-
     acquired-p))
 
 (defun loom--lock-release-cooperative (lock owner)
@@ -390,8 +392,9 @@
 
 (defun loom--lock-update-thread-metadata (lock effective-owner action)
   "Update thread lock metadata after native operations.
-  This function is called within `loom:with-mutex!` and `loom:lock-try-acquire`
-  to keep the `loom-lock` struct's fields consistent with the native mutex."
+  This function is called within `loom:with-mutex!` and
+  `loom:lock-try-acquire` to keep the `loom-lock` struct's fields
+  consistent with the native mutex."
   (when (loom-lock-native-mutex lock)
     (pcase action
       (:acquire
@@ -434,12 +437,14 @@
   "Create a new lock object (mutex) with comprehensive concurrency support.
 
   The lock's behavior depends on its MODE:
-  - `:deferred`: Cooperative, non-blocking, reentrant lock for single-threaded
-    asynchronous operations. Contention from different owners signals an error.
+  - `:deferred`: Cooperative, non-blocking, reentrant lock for
+    single-threaded asynchronous operations. Contention from different
+    owners signals an error.
   - `:thread`: Native OS thread mutex providing preemptive thread-safety.
     Blocking and implicitly reentrant.
-  - `:process`: Cooperative, non-blocking, reentrant lock for inter-process
-    coordination. Similar to `:deferred` but indicates inter-process usage.
+  - `:process`: Cooperative, non-blocking, reentrant lock for
+    inter-process coordination. Similar to `:deferred` but indicates
+    inter-process usage.
 
   Arguments:
   - NAME (string): Descriptive name for debugging and logging.
@@ -451,7 +456,8 @@
 
   Signals:
   - `loom-lock-invalid-mode-error` for invalid modes.
-  - `error` if `:thread` mode is requested but thread support is unavailable."
+  - `error` if `:thread` mode is requested but thread support is
+    unavailable."
   (loom--validate-lock-mode mode)
 
   ;; Auto-fallback from :thread to :deferred if threading unavailable.
@@ -507,8 +513,10 @@
     (pcase (loom-lock-mode lock)
       (:thread
        (loom-log :warn (loom-lock-name lock)
-                       "Direct acquire discouraged for :thread locks. Use loom:with-mutex!")
-       (error "loom:lock-acquire not recommended for :thread locks. Use loom:with-mutex! instead"))
+                       "Direct acquire discouraged for :thread locks.
+                        Use loom:with-mutex!")
+       (error "loom:lock-acquire not recommended for :thread locks.
+              Use loom:with-mutex! instead"))
       ((or :deferred :process)
        (loom--lock-acquire-cooperative lock effective-owner effective-timeout)))))
 
@@ -539,9 +547,10 @@
         (when (null (loom-lock-native-mutex lock))
           (loom--lock-signal-error
             'loom-invalid-lock-error
-            (format "Thread-mode lock '%s' has no native-mutex" (loom-lock-name lock))
+            (format "Thread-mode lock '%s' has no native-mutex"
+                    (loom-lock-name lock))
             lock)
-          (cl-return-from loom:lock-try-acquire nil)) ; Should not happen if lock is properly initialized.
+          (cl-return-from loom:lock-try-acquire nil)) ; Should not happen.
 
         (loom-log :warning (loom-lock-name lock)
                           "try-acquire is not available for :thread locks, "
@@ -563,7 +572,8 @@
               (loom--lock-update-stats lock :acquisition)
               (loom--lock-track-resource :acquire lock)
               (loom-log :debug (loom-lock-name lock)
-                              "Cooperative lock try-acquired by %S" effective-owner)
+                              "Cooperative lock try-acquired by %S"
+                              effective-owner)
               t)
           (loom-log :debug (loom-lock-name lock)
                           "Lock try-acquire failed: held by %S"
@@ -594,8 +604,10 @@
     (pcase (loom-lock-mode lock)
       (:thread
        (loom-log :warn (loom-lock-name lock)
-                       "Direct release discouraged for :thread locks. Use loom:with-mutex!")
-       (error "loom:lock-release not recommended for :thread locks. Use loom:with-mutex! instead"))
+                       "Direct release discouraged for :thread locks.
+                        Use loom:with-mutex!")
+       (error "loom:lock-release not recommended for :thread locks.
+              Use loom:with-mutex! instead"))
       ((or :deferred :process)
        (loom--lock-release-cooperative lock effective-owner)))))
 
@@ -618,7 +630,8 @@
       (:thread
        (and (loom-lock-native-mutex lock)
             (if (fboundp 'mutex-owner)
-                (equal (mutex-owner (loom-lock-native-mutex lock)) effective-owner)
+                (equal (mutex-owner (loom-lock-native-mutex lock))
+                       effective-owner)
               ;; Fallback if mutex-owner is not available.
               (equal (loom-lock-owner lock) effective-owner))))
       ((or :deferred :process)
@@ -663,7 +676,8 @@
   (let ((stats (gethash (loom-lock-name lock) loom--lock-global-stats)))
     (unless stats
       (loom-log :warn (loom-lock-name lock)
-                      "No statistics found for lock %S" (loom-lock-name lock))
+                      "No statistics found for lock %S"
+                      (loom-lock-name lock))
       (setq stats (list :acquisitions 0 :releases 0 :contentions 0
                         :total-hold-time 0.0 :max-hold-time 0.0 :timeouts 0
                         :created (float-time) :not-tracked t)))
@@ -698,7 +712,7 @@
   - Acquires and releases the lock with proper resource tracking.
   - Updates lock statistics and maintains deadlock detection state.
   - Logs debug information when enabled."
-  (declare (indent 1) (debug (form body)))
+  (declare (indent 1) (debug (form &rest form)))
   (let ((lock-var (gensym "lock-")))
     `(let ((,lock-var ,lock-form))
        (loom--validate-lock ,lock-var 'loom:with-mutex!)
@@ -712,107 +726,6 @@
          (_
           (error "Unsupported lock mode for loom:with-mutex!: %S"
                  (loom-lock-mode ,lock-var)))))))
-
-;;;###autoload
-(defmacro loom:with-mutex-try! (lock-form &rest body)
-  "Execute BODY within a critical section if the lock can be acquired.
-  This macro uses non-blocking acquisition and only executes BODY if the
-  lock was successfully acquired.
-
-  Arguments:
-  - `LOCK-FORM` (form): A form that evaluates to a `loom-lock` object.
-  - `BODY` (forms): The Lisp forms to execute while holding the lock.
-
-  Returns:
-  - The value of the last form in `BODY` if the lock was acquired, `nil`
-    otherwise.
-
-  Side Effects:
-  - Attempts to acquire and release the lock. Executes `BODY` forms if
-    successful."
-  (declare (indent 1) (debug (form &rest form)))
-  (let ((lock-var (gensym "lock-"))
-        (acquired-var (gensym "acquired-"))
-        (start-time-var (gensym "start-time-"))
-        (owner-var (gensym "owner-")))
-    `(let ((,lock-var ,lock-form)
-           (,acquired-var nil))
-       (loom--validate-lock ,lock-var 'loom:with-mutex-try!)
-       (let ((,start-time-var (float-time))
-             (,owner-var (loom--lock-get-effective-owner ,lock-var)))
-         (unwind-protect
-             (when (setq ,acquired-var (loom:lock-try-acquire ,lock-var ,owner-var))
-               ;; Push owner to stack for deadlock detection.
-               (when loom-lock-enable-deadlock-detection
-                 (push ,owner-var (loom-lock-owner-stack ,lock-var)))
-               (progn ,@body))
-           (when ,acquired-var
-             ;; Pop owner from stack.
-             (when loom-lock-enable-deadlock-detection
-               (pop (loom-lock-owner-stack ,lock-var)))
-             (loom:lock-release ,lock-var ,owner-var)
-             ;; Update hold time stats.
-             (loom--lock-update-stats ,lock-var :hold-time
-                                      (- (float-time) ,start-time-var))))
-         ,acquired-var)))) ; Return acquired-var for the macro's result.
-
-;;;###autoload
-(defmacro loom:with-mutex-timeout! (lock-form timeout-form &rest body)
-  "Execute BODY within a critical section, attempting to acquire the lock
-  with a specified timeout.
-
-  Arguments:
-  - `LOCK-FORM` (form): A form that evaluates to a `loom-lock` object.
-  - `TIMEOUT-FORM` (form): A form that evaluates to the timeout in seconds.
-  - `BODY` (forms): The Lisp forms to execute while holding the lock.
-
-  Returns:
-  - The value of the last form in `BODY` if the lock was acquired, `nil`
-    if the acquisition timed out.
-
-  Signals:
-  - `loom-lock-timeout-error` if the timeout is reached (unless handled
-    by the caller).
-  - Other errors from `loom:lock-acquire` or `BODY`."
-  (declare (indent 1) (debug form form &rest form))
-  (let ((lock-var (gensym "lock-"))
-        (timeout-var (gensym "timeout-"))
-        (acquired-var (gensym "acquired-"))
-        (start-time-var (gensym "start-time-"))
-        (owner-var (gensym "owner-")))
-    `(let* ((,lock-var ,lock-form)
-            (,timeout-var ,timeout-form)
-            (,acquired-var nil))
-       (loom--validate-lock ,lock-var 'loom:with-mutex-timeout!)
-       (let ((,start-time-var (float-time))
-             (,owner-var (loom--lock-get-effective-owner ,lock-var)))
-         (unwind-protect
-             (progn
-               (setq ,acquired-var
-                     (condition-case err
-                         (progn
-                           (loom:lock-acquire ,lock-var ,owner-var ,timeout-var)
-                           t)
-                       (loom-lock-timeout-error ; Catch timeout specifically.
-                        (loom-log :info (loom-lock-name ,lock-var)
-                                        "Lock acquisition timed out for with-mutex-timeout!")
-                        nil)
-                       (error ; Re-signal other errors.
-                        (signal (car err) (cdr err)))))
-               (when ,acquired-var
-                 ;; Push owner to stack for deadlock detection.
-                 (when loom-lock-enable-deadlock-detection
-                   (push ,owner-var (loom-lock-owner-stack ,lock-var)))
-                 (progn ,@body)))
-           (when ,acquired-var
-             ;; Pop owner from stack.
-             (when loom-lock-enable-deadlock-detection
-               (pop (loom-lock-owner-stack ,lock-var)))
-             (loom:lock-release ,lock-var ,owner-var) ; Call cooperative release.
-             ;; Update hold time stats.
-             (loom--lock-update-stats ,lock-var :hold-time
-                                      (- (float-time) ,start-time-var))))
-         ,acquired-var)))) ; Return acquired status.
 
 ;;;###autoload
 (defmacro loom:with-thread-mutex! (lock-form &rest body)
@@ -877,18 +790,18 @@
 Executes BODY within a critical section guarded by a cooperative lock.
 This macro ensures proper acquisition, release, and metadata updates.
 
-Arguments:
-- `LOCK-FORM` (form): A form that evaluates to a `loom-lock` object
-  in `:deferred` or `:process` mode.
-- `BODY` (forms): The Lisp forms to execute while holding the lock.
+  Arguments:
+  - `LOCK-FORM` (form): A form that evaluates to a `loom-lock` object
+    in `:deferred` or `:process` mode.
+  - `BODY` (forms): The Lisp forms to execute while holding the lock.
 
-Returns:
-- The value of the last form in `BODY`.
+  Returns:
+  - The value of the last form in `BODY`.
 
-Signals:
-- `error` if the lock is not in a cooperative mode.
-- Errors from `loom:lock-acquire` or `loom:lock-release`."
-  (declare (indent 1) (debug (form body)))
+  Signals:
+  - `error` if the lock is not in a cooperative mode.
+  - Errors from `loom:lock-acquire` or `loom:lock-release`."
+  (declare (indent 1) (debug (form &rest form)))
   (let ((lock-var (gensym "lock-"))
         (start-time-var (gensym "start-time-"))
         (owner-var (gensym "owner-")))
@@ -897,7 +810,8 @@ Signals:
             (,owner-var (loom--lock-get-effective-owner ,lock-var)))
        (loom--validate-lock ,lock-var 'loom:with-cooperative-mutex!)
        (unless (memq (loom-lock-mode ,lock-var) '(:deferred :process))
-         (error "loom:with-cooperative-mutex! requires cooperative mode lock, got: %S"
+         (error "loom:with-cooperative-mutex! requires cooperative mode lock,
+                got: %S"
                 (loom-lock-mode ,lock-var)))
 
        (loom-log :debug (loom-lock-name ,lock-var)
@@ -920,7 +834,110 @@ Signals:
          ;; Update hold time stats.
          (loom--lock-update-stats ,lock-var :hold-time
                                   (- (float-time) ,start-time-var))))))
-                                  
+
+;;;###autoload
+(defmacro loom:with-mutex-try! (lock-form &rest body)
+  "Execute BODY within a critical section if the lock can be acquired.
+  This macro uses non-blocking acquisition and only executes BODY if the
+  lock was successfully acquired.
+
+  Arguments:
+  - `LOCK-FORM` (form): A form that evaluates to a `loom-lock` object.
+  - `BODY` (forms): The Lisp forms to execute while holding the lock.
+
+  Returns:
+  - The value of the last form in `BODY` if the lock was acquired, `nil`
+    otherwise.
+
+  Side Effects:
+  - Attempts to acquire and release the lock. Executes `BODY` forms if
+    successful."
+  (declare (indent 1) (debug (form &rest form)))
+  (let ((lock-var (gensym "lock-"))
+        (acquired-var (gensym "acquired-"))
+        (start-time-var (gensym "start-time-"))
+        (owner-var (gensym "owner-")))
+    `(let ((,lock-var ,lock-form)
+           (,acquired-var nil))
+       (loom--validate-lock ,lock-var 'loom:with-mutex-try!)
+       (let ((,start-time-var (float-time))
+             (,owner-var (loom--lock-get-effective-owner ,lock-var)))
+         (unwind-protect
+             (when (setq ,acquired-var (loom:lock-try-acquire ,lock-var ,owner-var))
+               ;; Push owner to stack for deadlock detection.
+               (when loom-lock-enable-deadlock-detection
+                 (push ,owner-var (loom-lock-owner-stack ,lock-var)))
+               (progn ,@body))
+           (when ,acquired-var
+             ;; Pop owner from stack.
+             (when loom-lock-enable-deadlock-detection
+               (pop (loom-lock-owner-stack ,lock-var)))
+             (loom:lock-release ,lock-var ,owner-var)
+             ;; Update hold time stats.
+             (loom--lock-update-stats ,lock-var :hold-time
+                                      (- (float-time) ,start-time-var))))
+         ,acquired-var)))) ; Return acquired-var for the macro's result.
+
+;;;###autoload
+(defmacro loom:with-mutex-timeout! (lock-form timeout-form &rest body)
+  "Execute BODY within a critical section, attempting to acquire the lock
+  with a specified timeout.
+
+  Arguments:
+  - `LOCK-FORM` (form): A form that evaluates to a `loom-lock` object.
+  - `TIMEOUT-FORM` (form): A form that evaluates to the timeout in seconds.
+  - `BODY` (forms): The Lisp forms to execute while holding the lock.
+
+  Returns:
+  - The value of the last form in `BODY` if the lock was acquired, `nil`
+    if the acquisition timed out.
+
+  Signals:
+  - `loom-lock-timeout-error` if the timeout is reached (unless handled
+    by the caller).
+  - Other errors from `loom:lock-acquire` or `BODY`."
+  (declare (indent 1) (debug (form form &rest form)))
+  (let ((lock-var (gensym "lock-"))
+        (timeout-var (gensym "timeout-"))
+        (acquired-var (gensym "acquired-"))
+        (start-time-var (gensym "start-time-"))
+        (owner-var (gensym "owner-")))
+    `(let* ((,lock-var ,lock-form)
+            (,timeout-var ,timeout-form)
+            (,acquired-var nil))
+       (loom--validate-lock ,lock-var 'loom:with-mutex-timeout!)
+       (let ((,start-time-var (float-time))
+             (,owner-var (loom--lock-get-effective-owner ,lock-var)))
+         (unwind-protect
+             (progn
+               (setq ,acquired-var
+                     (condition-case err
+                         (progn
+                           (loom:lock-acquire ,lock-var ,owner-var
+                                              ,timeout-var)
+                           t)
+                       (loom-lock-timeout-error ; Catch timeout specifically.
+                        (loom-log :info (loom-lock-name ,lock-var)
+                                        "Lock acquisition timed out for
+                                         with-mutex-timeout!")
+                        nil)
+                       (error ; Re-signal other errors.
+                        (signal (car err) (cdr err)))))
+               (when ,acquired-var
+                 ;; Push owner to stack for deadlock detection.
+                 (when loom-lock-enable-deadlock-detection
+                   (push ,owner-var (loom-lock-owner-stack ,lock-var)))
+                 (progn ,@body)))
+           (when ,acquired-var
+             ;; Pop owner from stack.
+             (when loom-lock-enable-deadlock-detection
+               (pop (loom-lock-owner-stack ,lock-var)))
+             (loom:lock-release ,lock-var ,owner-var) ; Call cooperative release.
+             ;; Update hold time stats.
+             (loom--lock-update-stats ,lock-var :hold-time
+                                      (- (float-time) ,start-time-var))))
+         ,acquired-var)))) ; Return acquired status.
+
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Shutdown Hook
 
