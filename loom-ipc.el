@@ -45,7 +45,6 @@
 
 (declare-function loom-promise-p "loom-promise")
 (declare-function loom-promise-id "loom-promise")
-(declare-function loom:process-settled-on-main "loom-promise")
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Global State & Constants
@@ -311,6 +310,30 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Public IPC API
 
+(defun loom:process-settled-on-main (payload)
+  "Process a settlement message that has arrived on the main thread.
+This function is the end-point for messages from both background threads
+and external processes. It finds the target promise and settles it.
+
+Arguments:
+- `PAYLOAD` (plist): A plist containing settlement data, including `:id`,
+  `:value` or `:error`.
+
+Returns:
+- `nil`.
+
+Side Effects:
+- Resolves or rejects a promise, triggering its callback chain."
+  (let* ((id (plist-get payload :id))
+         (promise (loom-registry-get-promise-by-id id)))
+    (if (and promise (loom:pending-p promise))
+        (let ((value (plist-get payload :value))
+              (error (plist-get payload :error)))
+          (if error
+              (loom:reject promise error)
+            (loom:resolve promise value)))
+      (loom-log :debug id "IPC received settlement for non-pending/unknown promise."))))
+
 ;;;###autoload
 (defun loom:ipc-init ()
   "Initializes all IPC mechanisms. Idempotent.
@@ -397,7 +420,7 @@
               (condition-case err
                   (progn
                     ;; Try non-blocking join first
-                    (unless (thread-join loom--ipc-drain-thread 0.1)
+                    (unless (thread-join loom--ipc-drain-thread)
                       (loom-log :warn nil "Drain thread cleanup timeout, forcing quit.")
                       (when (thread-live-p loom--ipc-drain-thread)
                         (thread-signal loom--ipc-drain-thread 'quit nil)))

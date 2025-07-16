@@ -175,20 +175,23 @@ gracefully when `loom--scheduler-thread-running` becomes nil."
   (loom-log :info nil "Enhanced scheduler thread started.")
   (setq loom--scheduler-startup-time (current-time))
 
-  (while loom--scheduler-thread-running
-    (condition-case err
-        (when (loom-lock-p loom--periodic-tasks-mutex)
-          (loom:with-mutex! loom--periodic-tasks-mutex
-            (let ((task-ids (hash-table-keys loom--periodic-tasks-registry)))
-              (dolist (id task-ids)
-                (unless loom--scheduler-thread-running (cl-return))
-                (when-let ((task-info
-                            (gethash id loom--periodic-tasks-registry)))
-                  (loom--execute-periodic-task id task-info))))))
-      (error (loom-log :error nil "Error in scheduler loop: %S" err)))
+  (cl-block scheduler-loop
+    (while loom--scheduler-thread-running
+      (condition-case err
+          (when (loom-lock-p loom--periodic-tasks-mutex)
+            (loom:with-mutex! loom--periodic-tasks-mutex
+              (let ((task-ids (hash-table-keys loom--periodic-tasks-registry)))
+                (dolist (id task-ids)
+                  ;; If a shutdown is requested, exit the entire function.
+                  (unless loom--scheduler-thread-running
+                    (cl-return-from scheduler-loop nil))
+                  (when-let ((task-info (gethash id loom--periodic-tasks-registry)))
+                    (loom--execute-periodic-task id task-info))))))
+        (error (loom-log :error nil "Error in scheduler loop: %S" err)))
 
-    (when loom--scheduler-thread-running
-      (sleep-for loom-thread-polling-default-interval)))
+      ;; Sleep only if the loop is still meant to be running.
+      (when loom--scheduler-thread-running
+        (sleep-for loom-thread-polling-default-interval))))
 
   (loom-log :info nil "Scheduler thread stopped gracefully."))
 
@@ -318,36 +321,37 @@ Returns:
 Side Effects:
 - Signals the scheduler thread to terminate.
 - May forcibly signal `quit` to the thread if it doesn't stop in time."
-  (unless (and loom--scheduler-thread (thread-live-p loom--scheduler-thread))
-    (loom-log :debug nil
-              "Scheduler thread not running, nothing to stop.")
-    (cl-return-from loom:thread-polling-stop-scheduler-thread nil))
+  (cl-block loom:thread-polling-stop-scheduler-thread
+    (unless (and loom--scheduler-thread (thread-live-p loom--scheduler-thread))
+      (loom-log :debug nil
+                "Scheduler thread not running, nothing to stop.")
+      (cl-return-from loom:thread-polling-stop-scheduler-thread nil))
 
-  (loom-log :info nil "Initiating graceful scheduler shutdown.")
-  (setq loom--scheduler-thread-running nil)
+    (loom-log :info nil "Initiating graceful scheduler shutdown.")
+    (setq loom--scheduler-thread-running nil)
 
-  (let ((shutdown-successful
-         (condition-case nil
-             (loom:poll-with-backoff
-              (lambda () (not (thread-live-p loom--scheduler-thread)))
-              :debug-id 'scheduler-shutdown
-              :timeout loom-thread-polling-shutdown-timeout)
-           (loom-thread-polling-timeout nil))))
+    (let ((shutdown-successful
+          (condition-case nil
+              (loom:poll-with-backoff
+                (lambda () (not (thread-live-p loom--scheduler-thread)))
+                :debug-id 'scheduler-shutdown
+                :timeout loom-thread-polling-shutdown-timeout)
+            (loom-thread-polling-timeout nil))))
 
-    (if shutdown-successful
-        (loom-log :info nil "Scheduler thread stopped successfully.")
-      (loom-log :warn nil
-                "Scheduler thread did not stop gracefully within timeout.")
-      (when (and loom--scheduler-thread (thread-live-p loom--scheduler-thread))
-        (condition-case err
-            (progn
-              (loom-log :info nil "Attempting to forcibly signal thread quit.")
-              (thread-signal loom--scheduler-thread 'quit nil))
-          (error (loom-log :error nil
-                           "Error signaling thread quit: %S" err)))))
+      (if shutdown-successful
+          (loom-log :info nil "Scheduler thread stopped successfully.")
+        (loom-log :warn nil
+                  "Scheduler thread did not stop gracefully within timeout.")
+        (when (and loom--scheduler-thread (thread-live-p loom--scheduler-thread))
+          (condition-case err
+              (progn
+                (loom-log :info nil "Attempting to forcibly signal thread quit.")
+                (thread-signal loom--scheduler-thread 'quit nil))
+            (error (loom-log :error nil
+                            "Error signaling thread quit: %S" err)))))
 
-    (setq loom--scheduler-thread nil)
-    (not (thread-live-p loom--scheduler-thread))))
+      (setq loom--scheduler-thread nil)
+      (not (thread-live-p loom--scheduler-thread)))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Enhanced Task Management
