@@ -3,31 +3,40 @@
 ;;; Commentary:
 ;;
 ;; This module provides the core Inter-Process/Thread Communication (IPC)
-;; mechanisms for the Loom concurrency library. It enables safe and efficient
-;; message passing between different Emacs Lisp threads and external processes,
-;; ensuring that asynchronous operations can communicate their results back
-;; to the main Emacs thread without blocking the UI.
+;; mechanisms for the Loom concurrency library. It enables safe and
+;; efficient message passing between different Emacs Lisp threads and
+;; external processes, ensuring that asynchronous operations can
+;; communicate their results back to the main Emacs thread without blocking
+;; the UI.
 ;;
 ;; This module now **owns and manages all its global IPC state**, making it
-;; a self-contained and robust subsystem.
+;; a self-contained and robust subsystem. The design centers on two primary
+;; communication pathways, both dispatching to the main Emacs event loop.
 ;;
 ;; ## Key Features
 ;;
-;; - **Thread-Safe Queue Interaction:** Provides functions to enqueue/dequeue
-;;   messages from the global main thread queue defined in `loom-config.el`.
-;; - **Dedicated Drain Thread:** A background worker thread (`loom:ipc-drain-thread`)
-;;   that efficiently processes messages from the global thread-safe queue.
-;; - **Process-based IPC:** Uses `make-pipe-process` for communication with
-;;   external OS processes or for asynchronous re-queuing on the main thread.
-;; - **Unified Dispatch:** `loom:dispatch-to-main-thread` provides a single
-;;   entry point for sending messages to the main thread, intelligently
-;;   choosing the best communication path.
-;; - **Robust Error Handling:** Includes error definitions and logging for
-;;   IPC-specific issues.
+;; - **Thread-Safe Queue:** When running in an Emacs with thread support, a
+;;   dedicated, mutex-protected queue (`loom--ipc-main-thread-queue`) is
+;;   used for messages from background threads. This provides a direct,
+;;   low-overhead in-memory communication channel.
 ;;
-;; This module is designed to be highly efficient and robust, preventing
-;; busy-waiting and ensuring proper resource management during shutdown.
+;; - **Process-Based IPC:** A long-lived pipe process (`loom--ipc-process`)
+;;   serves as a general-purpose event source. It is used to asynchronously
+;;   re-queue work onto the main thread's event loop, even from the main
+;;   thread itself. This ensures a consistent, non-blocking asynchronous
+;;   workflow. Data sent through the pipe is JSON-serialized.
 ;;
+;; - **Polling-Based Draining:** The main thread is responsible for
+;;   draining the in-memory queue by periodically calling
+;;   `loom:ipc-drain-queue`. This is typically done within the main
+;;   scheduler tick. This polling design avoids the complexity of a
+;;   dedicated drain thread.
+;;
+;; - **Unified Dispatcher:** The function `loom:dispatch-to-main-thread`
+;;   acts as a single, intelligent entry point. It automatically selects the
+;;   correct communication channel (in-memory queue or process pipe) based
+;;   on the execution context (background thread vs. main thread).
+
 ;;; Code:
 
 (require 'cl-lib)
@@ -39,184 +48,120 @@
 (require 'loom-queue)
 (require 'loom-errors)
 (require 'loom-registry)
+(require 'loom-promise)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Forward Declarations
 
 (declare-function loom-promise-p "loom-promise")
-(declare-function loom-promise-id "loom-promise")
+(declare-function loom:pending-p "loom-promise")
+(declare-function loom:resolve "loom-promise")
+(declare-function loom:reject "loom-promise")
+(declare-function loom-registry-get-promise-by-id "loom-registry")
+(declare-function loom:deserialize-error "loom-errors")
+(declare-function loom-error-p "loom-errors")
+(declare-function loom:serialize-error "loom-errors")
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Global State & Constants
 
 (defvar loom--ipc-queue-mutex nil
-  "A `loom:lock` object providing thread-safe, exclusive access to
-  `loom--ipc-main-thread-queue`. Essential for coordinating producers
-  and consumers, preventing race conditions. Private to loom-ipc.el.")
+  "A `loom:lock` (mutex) that provides thread-safe, exclusive access to
+the `loom--ipc-main-thread-queue`. This is essential for preventing race
+conditions when multiple threads enqueue messages simultaneously.
 
-(defvar loom--ipc-queue-condition nil
-  "A `condition-variable` used with `loom--ipc-queue-mutex`. The
-  `loom--ipc-drain-thread` waits on this, sleeping efficiently until
-  new messages are added to the queue. Private to loom-ipc.el.")
+It is initialized by `loom:ipc-init` and is private to this module.")
 
 (defvar loom--ipc-main-thread-queue nil
-  "A thread-safe `loom:queue` for messages destined for the main Emacs
-  thread. This is the primary low-overhead communication channel for
-  background threads to signal events (e.g., promise settlements).
-  Private to loom-ipc.el.")
+  "A thread-safe `loom:queue` for messages originating from background
+threads and destined for the main Emacs thread. It is drained
+periodically by `loom:ipc-drain-queue` on the main thread.
 
-(defvar loom--ipc-drain-thread nil
-  "The dedicated background thread responsible for processing
-  inter-thread messages enqueued in `loom--ipc-main-thread-queue`. It
-  waits on `loom--ipc-queue-condition` and, upon being signaled, drains
-  the queue and schedules work on the main Emacs thread. Private to
-  loom-ipc.el.")
-
-(defvar loom--ipc-drain-shutdown nil
-  "A boolean flag used to signal `loom--ipc-drain-thread` to terminate
-  gracefully. When `t`, the drain thread's main loop will exit. Private to
-  loom-ipc.el.")
+It is initialized by `loom:ipc-init` and is private to this module.")
 
 (defvar loom--ipc-process nil
-  "The long-lived `make-pipe-process` instance used for external IPC
-  and for main thread re-queuing. Acts as a message loopback. Private to
-  loom-ipc.el.")
+  "The long-lived `make-pipe-process` instance used for IPC. This process
+acts as an event source for the main Emacs event loop. Messages sent to it
+are received by the filter function (`loom--ipc-filter`) on the main
+thread, providing a mechanism for asynchronous execution.
+
+It is managed by `loom:ipc-init` and `loom:ipc-cleanup` and is private.")
 
 (defvar loom--ipc-buffer nil
-  "A dedicated temporary buffer used by `loom--ipc-filter` for
-  accumulating partial JSON messages from `loom--ipc-process`. Ensures
-  complete JSON lines are reassembled before parsing. Private to
-  loom-ipc.el.")
+  "A dedicated temporary buffer used by the process filter function
+`loom--ipc-filter` to accumulate incoming data chunks. This is necessary
+because process output can arrive in arbitrary fragments, and this buffer
+ensures we only process complete, newline-terminated lines.
 
-(defvar loom--ipc-filter-max-chunk-size 4096
-  "Maximum size of data to process in one filter call to prevent UI freezing.")
+It is managed by `loom:ipc-init` and `loom:ipc-cleanup` and is private.")
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Error Definitions
 
 (define-error 'loom-ipc-queue-uninitialized-error
-  "Attempted to use an uninitialized IPC queue."
+  "Error signaled when an operation is attempted on the IPC queue
+before it has been properly initialized by `loom:ipc-init`."
   'loom-error)
 
 (define-error 'loom-ipc-process-error
-  "An error occurred with the IPC pipe process."
+  "Error signaled when the underlying IPC pipe process encounters a
+fatal error or fails to initialize."
   'loom-error)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Internal IPC Helpers
 
-(defun loom--ipc-drain-main-thread-queue-batch ()
-  "Drains messages from `loom--ipc-main-thread-queue` in a batch.
-  Caller **must** hold `loom--ipc-queue-mutex`. Schedules messages
-  for main thread processing via `run-at-time`. Returns count of
-  messages processed. This function is for internal use by the
-  `loom--ipc-drain-thread` exclusively."
-  (cl-block loom--ipc-drain-main-thread-queue-batch
-    (unless (and (loom-queue-p loom--ipc-main-thread-queue)
-                 (not (loom:queue-empty-p loom--ipc-main-thread-queue)))
-      (cl-return-from loom--ipc-drain-main-thread-queue-batch 0))
+(defun loom--ipc-enqueue (message)
+  "Thread-safely enqueues a `MESSAGE` onto the main thread's IPC queue.
 
-    (let ((processed-count 0)
-          (max-batch-size 100)
-          (messages-to-process '()))
-      (while (and (< processed-count max-batch-size)
-                  (not (loom:queue-empty-p loom--ipc-main-thread-queue)))
-        (when-let ((message (loom:queue-dequeue loom--ipc-main-thread-queue)))
-          (push message messages-to-process)
-          (cl-incf processed-count)))
+This is the primary entry point for a background thread to send data to
+the main thread. It acquires a mutex lock to ensure that the queue
+operation is atomic and safe from race conditions.
 
-      (when messages-to-process
-        (loom-log :debug nil "Scheduling %d messages for main thread."
-                  processed-count)
-        ;; Schedule processing on main thread. Reversing restores order.
-        (dolist (message (reverse messages-to-process))
-          (run-at-time 0 nil #'loom:process-settled-on-main message)))
-      processed-count)))
+Arguments:
+- `MESSAGE` (any): The message to enqueue, typically a plist.
 
-(defun loom--ipc-drain-worker-thread ()
-  "The main function for the dedicated background drain thread.
-  This function runs in an indefinite loop. It efficiently waits for
-  messages on `loom--ipc-queue-condition` and, upon waking, drains
-  the queue in batches via `loom--ipc-drain-main-thread-queue-batch`.
-  This loop terminates only when `loom--ipc-drain-shutdown` is set.
-  Handles errors internally to ensure the thread remains robust."
-  (loom-log :info nil "Queue drain worker thread started.")
-  
-  ;; Wait for proper initialization before starting main loop
-  (while (and (not loom--ipc-drain-shutdown)
-              (not (and loom--ipc-queue-mutex 
-                        loom--ipc-queue-condition 
-                        loom--ipc-main-thread-queue)))
-    (loom-log :debug nil "Worker thread waiting for IPC initialization...")
-    (sleep-for 0.1))
-  
-  (condition-case err
-      (while (not loom--ipc-drain-shutdown)
-        (condition-case inner-err
-            (loom:with-mutex! loom--ipc-queue-mutex
-              ;; Wait for signal if queue is empty and not shutting down
-              (while (and (not loom--ipc-drain-shutdown)
-                          (or (not (loom-queue-p loom--ipc-main-thread-queue))
-                              (loom:queue-empty-p loom--ipc-main-thread-queue)))
-                (loom-log :debug nil "Drain worker: waiting for signal...")
-                (condition-wait loom--ipc-queue-condition))
-              
-              ;; Process messages if not shutting down
-              (unless loom--ipc-drain-shutdown
-                (loom--ipc-drain-main-thread-queue-batch)))
-          (error
-           (loom-log :error nil "Error in drain worker loop: %S" inner-err)
-           ;; Longer pause on error to prevent tight error loops
-           (sleep-for 0.5))))
-    (error
-     (loom-log :error nil "Queue drain worker thread crashed: %S" err)))
-  
-  (loom-log :info nil "Queue drain worker thread exiting."))
+Returns:
+- `nil`.
 
-(defun loom--ipc-enqueue-with-signal (message)
-  "Enqueues `MESSAGE` onto `loom--ipc-main-thread-queue` and signals.
-  This is the thread-safe entry point for background threads to send
-  a message to the main thread via the drain worker. It acquires the
-  mutex, enqueues the message, and notifies the waiting drain thread.
-
-  Arguments:
-  - `MESSAGE` (any): The message to enqueue.
-
-  Returns:
-  - `nil`. Signals `loom-ipc-queue-uninitialized-error` if queue not init."
-  (unless (and loom--ipc-main-thread-queue
-               (loom-queue-p loom--ipc-main-thread-queue))
+Signals:
+- `loom-ipc-queue-uninitialized-error`: If the IPC queue or its
+  mutex has not been initialized via `loom:ipc-init`."
+  ;; Ensure the core IPC components for threading are ready.
+  (unless (and loom--ipc-queue-mutex loom--ipc-main-thread-queue)
     (signal 'loom-ipc-queue-uninitialized-error
-            '(:message "Main thread IPC queue not initialized.")))
+            '(:message "Main thread IPC queue/mutex not initialized.")))
+  ;; Lock the mutex, enqueue the message, and release the lock.
   (loom:with-mutex! loom--ipc-queue-mutex
-    (loom:queue-enqueue loom--ipc-main-thread-queue message)
-    (condition-notify loom--ipc-queue-condition))
-  (loom-log :debug (plist-get message :id) "Enqueued message; signaled worker.")
+    (loom:queue-enqueue loom--ipc-main-thread-queue message))
+  (loom-log :debug (plist-get message :id) "Enqueued message for main thread.")
   nil)
 
 (defun loom--ipc-parse-pipe-line (line-text)
-  "Parses a single, complete line of JSON from the IPC process.
-  This helper for `loom--ipc-filter` expects a newline-trimmed string.
-  It decodes the JSON and dispatches the payload based on its `:type`.
-  Handles `:promise-settled`, `:log`, and unknown message types.
+  "Parses a single, newline-terminated JSON string from the IPC process.
 
-  Arguments:
-  - `LINE-TEXT` (string): A complete JSON string.
+This function decodes the JSON payload and dispatches it based on the
+message `:type`. It is designed to be robust against malformed JSON
+or unexpected message types.
 
-  Returns:
-  - `nil`. Logs errors on failure."
+Arguments:
+- `LINE-TEXT` (string): A complete JSON string received from the pipe.
+
+Returns: `nil`. Errors are logged but not re-thrown."
   (cl-block loom--ipc-parse-pipe-line
+    ;; Ignore empty or whitespace-only lines.
     (when (s-blank? line-text)
       (cl-return-from loom--ipc-parse-pipe-line nil)))
 
+  ;; Use a condition-case to gracefully handle parsing errors.
   (condition-case err
+      ;; Configure JSON parsing to use plists and keywords for consistency.
       (let* ((json-object-type 'plist)
              (json-array-type 'list)
              (json-key-type 'keyword)
              (payload (json-read-from-string line-text))
              (msg-type (plist-get payload :type)))
-        (loom-log :debug nil "IPC filter received: %s (Type: %S)"
-                  (s-truncate 80 line-text) msg-type)
+        ;; Dispatch the message based on its type.
         (pcase msg-type
           (:promise-settled
            (loom:process-settled-on-main payload))
@@ -226,84 +171,81 @@
              (when (and level message)
                (loom-log level nil "IPC remote log: %s" message))))
           (_
-           (loom-log :warn nil "IPC filter unknown type: %S" msg-type))))
+           (loom-log :warn nil
+                     "IPC filter received unknown message type: %S" msg-type))))
     (json-error
-     (loom-log :error nil "JSON parse error in IPC: %S, line: %S" err line-text))
+     (loom-log :error nil "JSON parse error in IPC: %S, line: %S"
+               err line-text))
     (error
-     (loom-log :error nil "Error parsing IPC message: %S, line: %S" err line-text))))
+     (loom-log :error nil "General error parsing IPC message: %S, line: %S"
+               err line-text))))
 
 (defun loom--ipc-filter (process string)
-  "Improved filter function that processes data in chunks to prevent UI freezing.
-  
-  Arguments:
-  - `PROCESS` (process): The `make-pipe-process` instance.
-  - `STRING` (string): The latest chunk of output from the process.
+  "Process filter function for `loom--ipc-process`.
 
-  Returns: `nil`."
+This function is called by Emacs whenever `loom--ipc-process` writes to
+its standard output. Since data can arrive in arbitrary chunks, this
+function appends the incoming `STRING` to a dedicated buffer,
+`loom--ipc-buffer`, and then processes any complete, newline-terminated
+lines found in that buffer.
+
+Arguments:
+- `PROCESS` (process): The `make-pipe-process` instance (unused).
+- `STRING` (string): The latest chunk of output from the process.
+
+Returns: `nil`."
   (condition-case err
       (progn
+        ;; Ensure the dedicated buffer for this filter is alive.
         (unless (buffer-live-p loom--ipc-buffer)
           (setq loom--ipc-buffer (generate-new-buffer " *loom-ipc-filter*"))
           (with-current-buffer loom--ipc-buffer
+            ;; Disable multibyte chars for raw data processing.
             (setq-local enable-multibyte-characters nil)))
 
-        ;; Limit processing chunk size to prevent UI freezing
-        (let ((chunk-size (min (length string) loom--ipc-filter-max-chunk-size)))
-          (when (< chunk-size (length string))
-            (loom-log :debug nil "Large IPC chunk, processing in parts: %d/%d" 
-                     chunk-size (length string))
-            ;; Schedule remaining data for next iteration
-            (run-at-time 0.01 nil 
-              (lambda () 
-                (loom--ipc-filter process (substring string chunk-size)))))
-          
-          (setq string (substring string 0 chunk-size)))
-
+        ;; 1. Append the new chunk of data to our buffer.
         (with-current-buffer loom--ipc-buffer
           (save-excursion (goto-char (point-max)) (insert string)))
 
-        ;; Process complete lines with a limit to prevent blocking
+        ;; 2. Process all complete lines in the buffer.
         (with-current-buffer loom--ipc-buffer
-          (let ((line-start (point-min))
-                (lines-processed 0)
-                (max-lines-per-batch 10))
+          (let ((line-start (point-min)))
             (goto-char line-start)
-            (while (and (< lines-processed max-lines-per-batch)
-                        (re-search-forward "\n" nil t))
+            ;; Search for the next newline character.
+            (while (re-search-forward "\n" nil t)
               (let* ((line-end (match-end 0))
+                     ;; Extract the complete line without the newline.
                      (line-text (buffer-substring-no-properties
                                  line-start (1- line-end))))
+                ;; Parse the line if it contains content.
                 (unless (s-blank? line-text)
-                  (loom--ipc-parse-pipe-line line-text)
-                  (cl-incf lines-processed)))
+                  (loom--ipc-parse-pipe-line line-text)))
+              ;; Move the start pointer to the beginning of the next line.
               (setq line-start (point)))
-            
-            ;; If we hit the batch limit, schedule continuation
-            (when (and (>= lines-processed max-lines-per-batch)
-                       (re-search-forward "\n" nil t))
-              (loom-log :debug nil "IPC filter batch limit reached, scheduling continuation")
-              (run-at-time 0.01 nil 
-                (lambda () 
-                  (loom--ipc-filter process ""))))
-            
+            ;; 3. Delete the processed lines from the buffer, leaving any
+            ;;    partial line for the next invocation.
             (delete-region (point-min) line-start))))
     (error (loom-log :error nil "Error in IPC filter: %S" err)))
   nil)
 
 (defun loom--ipc-sentinel (process event)
-  "The sentinel function for `loom--ipc-process`.
-  Monitors for unexpected termination of the IPC process. If the
-  process dies, it logs an error and triggers a cleanup to release
-  resources and prevent leaks.
+  "Sentinel function for `loom--ipc-process`.
 
-  Arguments:
-  - `PROCESS` (process): The process whose state changed.
-  - `EVENT` (string): Description of the state change.
+This function is called by Emacs when the state of `loom--ipc-process`
+changes (e.g., it exits or crashes). Its primary purpose is to detect
+unexpected termination and trigger a cleanup and re-initialization
+cycle to maintain system stability.
 
-  Returns: `nil`."
-  (loom-log :warn nil "IPC process sentinel: %s" (s-trim event))
+Arguments:
+- `PROCESS` (process): The process whose state changed.
+- `EVENT` (string): A string describing the state change event.
+
+Returns: `nil`."
+  (loom-log :warn nil "IPC process sentinel triggered: %s" (s-trim event))
+  ;; If the process terminated unexpectedly, it's a critical failure.
   (when (string-match-p "\\(finished\\|exited\\|failed\\)" event)
     (loom-log :error nil "IPC process terminated unexpectedly. Cleaning up.")
+    ;; Clean up all IPC resources to prevent a broken state.
     (loom:ipc-cleanup))
   nil)
 
@@ -311,200 +253,224 @@
 ;;; Public IPC API
 
 (defun loom:process-settled-on-main (payload)
-  "Process a settlement message that has arrived on the main thread.
-This function is the end-point for messages from both background threads
-and external processes. It finds the target promise and settles it.
+  "Processes a settlement message that has arrived on the main thread.
+
+This function is the final destination for promise settlement messages,
+whether they arrive from the thread queue or the process pipe. It finds the
+target promise in the global registry and settles it with the provided
+value or error.
 
 Arguments:
-- `PAYLOAD` (plist): A plist containing settlement data, including `:id`,
-  `:value` or `:error`.
+- `PAYLOAD` (plist): A plist containing settlement data. Must include `:id`
+  and either `:value` or `:error`. May also include `:value-is-json` hint.
 
 Returns:
 - `nil`.
 
 Side Effects:
-- Resolves or rejects a promise, triggering its callback chain."
+- Resolves or rejects a registered `loom-promise`, which will trigger its
+  callback chain to execute on the main thread."
   (let* ((id (plist-get payload :id))
          (promise (loom-registry-get-promise-by-id id)))
     (if (and promise (loom:pending-p promise))
-        (let ((value (plist-get payload :value))
-              (error (plist-get payload :error)))
-          (if error
-              (loom:reject promise error)
-            (loom:resolve promise value)))
-      (loom-log :debug id "IPC received settlement for non-pending/unknown promise."))))
+        ;; The promise exists and is waiting for settlement.
+        (let* ((value (plist-get payload :value))
+               (error-data (plist-get payload :error))
+               (value-is-json (plist-get payload :value-is-json))
+               ;; If value was JSON-encoded for transport, decode it now.
+               (final-value (if (and value-is-json (stringp value))
+                                (json-read-from-string value)
+                              value))
+               ;; If the error was serialized for transport, deserialize it.
+               (final-error (if (and error-data (not (loom-error-p error-data)))
+                                (loom:deserialize-error error-data)
+                              error-data)))
+          ;; Settle the promise with either the final value or the final error.
+          (if final-error
+              (loom:reject promise final-error)
+            (loom:resolve promise final-value)))
+      ;; This can happen if a promise was cancelled or timed out before
+      ;; the settlement message arrived. It's not necessarily an error.
+      (loom-log :debug id
+                "IPC received settlement for non-pending/unknown promise."))))
 
 ;;;###autoload
 (defun loom:ipc-init ()
-  "Initializes all IPC mechanisms. Idempotent.
-  Sets up the thread-safe queue, condition variable, mutex, and starts
-  the dedicated drain thread. Also initializes the process-based pipe
-  for external communication. This function should be called once on startup.
+  "Initializes all IPC mechanisms, including the thread queue and the
+process pipe. This function is idempotent and safe to call multiple times.
 
-  Returns: `nil`."
-  (loom-log :info nil "Initializing IPC system.")
-  
-  ;; Initialize thread-based IPC if threading is available
+Returns: `nil`."
+  (loom-log :info nil "Initializing Loom IPC system.")
+
+  ;; Section 1: Initialize components for thread-based communication.
+  ;; This only runs if the current Emacs supports `make-thread`.
   (when (fboundp 'make-thread)
-    (loom-log :info nil "Initializing thread-based IPC.")
-    
-    ;; Initialize synchronization primitives first
     (unless loom--ipc-queue-mutex
-      (setq loom--ipc-queue-mutex (loom:lock "loom-ipc-queue-mutex")))
-    (unless loom--ipc-queue-condition
-      (setq loom--ipc-queue-condition 
-        (make-condition-variable (loom-lock-native-mutex loom--ipc-queue-mutex))))
-    
-    ;; Initialize queue
+      (setq loom--ipc-queue-mutex
+            (loom:lock "loom-ipc-queue-mutex" :mode :thread)))
     (unless (loom-queue-p loom--ipc-main-thread-queue)
-      (setq loom--ipc-main-thread-queue (loom:queue)))
+      (setq loom--ipc-main-thread-queue (loom:queue))))
 
-    ;; Only start drain thread after all prerequisites are ready
-    (when (and loom--ipc-queue-mutex 
-               loom--ipc-queue-condition 
-               loom--ipc-main-thread-queue
-               (or (null loom--ipc-drain-thread)
-                   (not (thread-live-p loom--ipc-drain-thread))))
-      (setq loom--ipc-drain-shutdown nil)
-      (loom-log :debug nil "Starting IPC drain thread.")
-      (setq loom--ipc-drain-thread
-            (make-thread #'loom--ipc-drain-worker-thread "loom-ipc-drain-worker"))))
-
-  ;; Initialize process-based IPC
+  ;; Section 2: Initialize the process-based communication channel.
+  ;; This runs on all Emacs versions and is the primary async mechanism.
   (unless (and loom--ipc-process (process-live-p loom--ipc-process))
-    (loom-log :info nil "Initializing IPC pipe process.")
     (condition-case err
         (progn
-          (setq loom--ipc-buffer (generate-new-buffer " *loom-ipc-filter*"))
-          (with-current-buffer loom--ipc-buffer
-            (setq-local enable-multibyte-characters nil))
-          
-          ;; Create process with better error handling
+          (setq loom--ipc-buffer
+                (generate-new-buffer " *loom-ipc-filter*"))
           (setq loom--ipc-process
                 (make-pipe-process
                  :name "loom-ipc-listener"
-                 :buffer nil  ; Don't associate with a buffer to avoid issues
                  :noquery t
                  :coding 'utf-8-emacs-unix
                  :filter #'loom--ipc-filter
-                 :sentinel #'loom--ipc-sentinel))
-          
-          (loom-log :info nil "IPC pipe process initialized successfully."))
+                 :sentinel #'loom--ipc-sentinel)))
       (error
+       ;; If process creation fails, log the error and ensure a clean state.
        (loom-log :error nil "Failed to initialize IPC pipe process: %S" err)
-       (setq loom--ipc-process nil)
-       (when loom--ipc-buffer
-         (kill-buffer loom--ipc-buffer)
-         (setq loom--ipc-buffer nil)))))
+       (when loom--ipc-buffer (kill-buffer loom--ipc-buffer))
+       (setq loom--ipc-process nil loom--ipc-buffer nil)
+       (signal 'loom-ipc-process-error (list err)))))
   nil)
 
 ;;;###autoload
 (defun loom:ipc-cleanup ()
-  "Shuts down all IPC resources gracefully without blocking the UI.
-  This is safe to call multiple times and won't freeze the main thread.
+  "Shuts down and cleans up all IPC resources.
 
-  Returns: `nil`."
+This function stops the IPC process, kills its associated buffer, and
+resets all global state variables. It is idempotent and safe to call
+even if the system is already clean. It is hooked into `kill-emacs-hook`
+to ensure graceful shutdown.
+
+Returns: `nil`."
   (loom-log :info nil "Cleaning up IPC resources.")
-  
-  ;; Shut down the drain thread asynchronously
-  (when loom--ipc-drain-thread
-    (condition-case err
-        (progn
-          (loom:with-mutex! loom--ipc-queue-mutex
-            (setq loom--ipc-drain-shutdown t)
-            (condition-notify loom--ipc-queue-condition))
-          
-          ;; Use async timer to check thread completion instead of blocking
-          (run-at-time 0.1 nil 
-            (lambda ()
-              (condition-case err
-                  (progn
-                    ;; Try non-blocking join first
-                    (unless (thread-join loom--ipc-drain-thread)
-                      (loom-log :warn nil "Drain thread cleanup timeout, forcing quit.")
-                      (when (thread-live-p loom--ipc-drain-thread)
-                        (thread-signal loom--ipc-drain-thread 'quit nil)))
-                    (setq loom--ipc-drain-thread nil))
-                (error (loom-log :error nil "Error in async thread cleanup: %S" err))))))
-      (error (loom-log :error nil "Error initiating drain thread cleanup: %S" err))))
-
-  ;; Reset thread-related state immediately
-  (setq loom--ipc-queue-condition nil)
+  ;; Reset thread-related state variables.
   (setq loom--ipc-queue-mutex nil)
   (setq loom--ipc-main-thread-queue nil)
-  (setq loom--ipc-drain-shutdown nil)
 
-  ;; Shut down the IPC process
-  (when loom--ipc-process
-    (condition-case err
-        (when (process-live-p loom--ipc-process)
-          (delete-process loom--ipc-process))
-      (error (loom-log :error nil "Error cleaning IPC process: %S" err)))
-    (setq loom--ipc-process nil))
+  ;; Shut down the long-lived IPC process.
+  (when (and loom--ipc-process (process-live-p loom--ipc-process))
+    (delete-process loom--ipc-process))
+  (setq loom--ipc-process nil)
 
-  ;; Clean up the IPC buffer
-  (when loom--ipc-buffer
-    (condition-case err
-        (when (buffer-live-p loom--ipc-buffer) (kill-buffer loom--ipc-buffer))
-      (error (loom-log :error nil "Error cleaning IPC buffer: %S" err)))
-    (setq loom--ipc-buffer nil))
+  ;; Clean up the dedicated IPC filter buffer.
+  (when (and loom--ipc-buffer (buffer-live-p loom--ipc-buffer))
+    (kill-buffer loom--ipc-buffer))
+  (setq loom--ipc-buffer nil)
   nil)
 
 ;;;###autoload
-(defun loom:dispatch-to-main-thread (promise &optional message-type data)
-  "Dispatches a message to the main thread with improved error handling.
-  
-  Arguments:
-  - `PROMISE` (loom-promise): The promise object being settled.
-  - `MESSAGE-TYPE` (symbol, optional): Type, defaults to `:promise-settled`.
-  - `DATA` (plist, optional): Additional message payload.
+(defun loom:ipc-drain-queue ()
+  "Drains and processes all messages from the in-memory IPC queue.
 
-  Returns: `nil`."
+This function should be called periodically from the main thread,
+typically as part of a central scheduler's tick. It performs a two-step
+process to minimize the time a mutex is held:
+1. Atomically transfer all messages from the global queue to a local list.
+2. Process the messages from the local list, now that the lock is released.
+
+Returns:
+- (integer): The number of messages that were processed."
+  (let ((messages-to-process '())
+        (processed-count 0))
+    ;; Step 1: Atomically grab all messages from the shared queue. This
+    ;; block is kept as short as possible to avoid blocking producer threads.
+    (when (and loom--ipc-queue-mutex loom--ipc-main-thread-queue)
+      (loom:with-mutex! loom--ipc-queue-mutex
+        (while (not (loom:queue-empty-p loom--ipc-main-thread-queue))
+          (push (loom:queue-dequeue loom--ipc-main-thread-queue)
+                messages-to-process))))
+
+    ;; Step 2: Process the collected messages outside the mutex lock.
+    ;; This allows other threads to enqueue new messages while we work.
+    (when messages-to-process
+      ;; Messages were pushed onto the list, so nreverse restores FIFO order.
+      (setq messages-to-process (nreverse messages-to-process))
+      (setq processed-count (length messages-to-process))
+      (loom-log :debug nil
+                "Draining %d messages from IPC queue." processed-count)
+      ;; Process each message, which typically involves settling a promise.
+      (dolist (message messages-to-process)
+        (loom:process-settled-on-main message)))
+    processed-count))
+
+;;;###autoload
+(defun loom:dispatch-to-main-thread (promise &optional message-type data)
+  "Dispatches a settlement message for a `PROMISE` to the main thread.
+
+This is the universal function for sending a promise result back for
+processing on the main Emacs event loop. It intelligently chooses the
+correct communication channel based on the current context.
+
+Arguments:
+- `PROMISE` (loom-promise): The promise object being settled.
+- `MESSAGE-TYPE` (symbol, optional): The message type, which defaults to
+  `:promise-settled`.
+- `DATA` (plist, optional): The message payload, typically `(:value ...)`
+  or `(:error ...)`.
+
+Returns: `nil`."
   (unless (loom-promise-p promise)
     (signal 'wrong-type-argument (list 'loom-promise-p promise)))
 
+  ;; Construct the full message payload.
   (let* ((promise-id (loom-promise-id promise))
          (full-payload (append `(:id ,promise-id
                                  :type ,(or message-type :promise-settled))
                                data)))
     (cond
-      ;; Path 1: From background thread, use efficient thread queue
-      ((and (fboundp 'current-thread) (not (eq (current-thread) main-thread)))
-       (loom-log :debug promise-id "Dispatching via thread queue.")
+      ;; Path 1: Executing in a background thread.
+      ;; Use the fast, in-memory, thread-safe queue. Data is passed directly
+      ;; as a Lisp object, as we are in the same Emacs process.
+      ((and (fboundp 'current-thread) (not (eq (current-thread) (thread-main))))
        (condition-case err
-           (loom--ipc-enqueue-with-signal full-payload)
-         (error 
-          (loom-log :error promise-id "Thread queue dispatch failed: %S" err)
-          ;; Fallback to direct call
-          (run-at-time 0 nil #'loom:process-settled-on-main full-payload))))
+           (loom--ipc-enqueue full-payload)
+         (error (loom-log :error promise-id
+                          "Thread queue dispatch failed: %S" err))))
 
-      ;; Path 2: From main thread, use pipe process (async to prevent blocking)
+      ;; Path 2: Executing on the main thread or in a process context.
+      ;; Use the pipe process to schedule the work asynchronously on the
+      ;; main event loop. This is crucial for maintaining a non-blocking
+      ;; pattern even when an async operation finishes immediately.
       ((and loom--ipc-process (process-live-p loom--ipc-process))
-       (loom-log :debug promise-id "Dispatching via IPC process re-queue.")
        (condition-case err
-           (let ((json-message (json-encode full-payload)))
-             ;; Use async approach to prevent blocking
-             (run-at-time 0.001 nil 
-               (lambda ()
-                 (condition-case send-err
-                     (process-send-string loom--ipc-process 
-                                          (format "%s\n" json-message))
-                   (error 
-                    (loom-log :error promise-id "IPC process send failed: %S" send-err)
-                    ;; Fallback to direct processing
-                    (loom:process-settled-on-main full-payload))))))
-         (error 
-          (loom-log :error promise-id "IPC process dispatch setup failed: %S" err)
-          ;; Fallback to direct call
-          (run-at-time 0 nil #'loom:process-settled-on-main full-payload))))
+           (let* ((payload-to-send (copy-sequence full-payload))
+                  (error-data (plist-get payload-to-send :error))
+                  (value-data (plist-get payload-to-send :value)))
 
-      ;; Path 3: Fallback for when IPC isn't ready
+             ;; If the payload contains a structured error, it must be
+             ;; serialized into a plist before JSON encoding.
+             (when (and error-data (loom-error-p error-data))
+               (setf (plist-get payload-to-send :error)
+                     (loom:serialize-error error-data)))
+
+             ;; If the value is a complex Lisp type (list/hash), it must
+             ;; be serialized to a JSON string. We add a hint so the receiver
+             ;; knows to parse it.
+             (when (or (listp value-data) (hash-table-p value-data))
+               (setf (plist-get payload-to-send :value)
+                     (json-encode value-data))
+               (setf (plist-get payload-to-send :value-is-json) t))
+
+             ;; Encode the final payload to a JSON string and send it to the
+             ;; pipe, followed by a newline to mark the end of the message.
+             (let ((json-message (json-encode payload-to-send)))
+               (process-send-string loom--ipc-process
+                                    (format "%s\n" json-message))))
+         (error (loom-log :error promise-id
+                          "IPC process dispatch failed: %S" err))))
+
+      ;; Path 3: Fallback for when the IPC process isn't ready.
+      ;; This is a last resort to prevent losing the message. It uses
+      ;; `run-at-time` to schedule the processing on a future tick of the
+      ;; event loop, simulating the asynchronicity of the pipe.
       (t
-       (loom-log :debug promise-id "Dispatching via direct timer fallback.")
+       (loom-log :warn promise-id "IPC dispatch falling back to run-at-time.")
        (run-at-time 0 nil #'loom:process-settled-on-main full-payload)))
     nil))
 
-;; Register a hook to ensure cleanup on Emacs exit.
+;; Register a hook to ensure IPC resources are released when Emacs exits.
+;; This prevents orphaned processes or memory leaks.
 (add-hook 'kill-emacs-hook #'loom:ipc-cleanup)
 
 (provide 'loom-ipc)
