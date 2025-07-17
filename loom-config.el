@@ -8,31 +8,35 @@
 ;;
 ;; ## Core Responsibilities
 ;;
-;; 1.  **Lifecycle Management:** Provides a clear public API (`loom:init`,
-;;     `loom:shutdown`) to start up and tear down the library's global
-;;     resources. Initialization is idempotent, and shutdown is automatically
-;;     handled when Emacs exits.
+;; 1.  **Lifecycle Management:** Provides a clear public API (`loom:init`,
+;;     `loom:shutdown`) to start up and tear down the library's global
+;;     resources. Initialization is idempotent, and shutdown is automatically
+;;     handled when Emacs exits.
 ;;
-;; 2.  **Task Scheduling:** Implements and manages two distinct schedulers to
-;;     comply with Promise/A+ specifications for execution order:
-;;     - **Microtask Queue:** A high-priority queue for immediate, internal
-;;       operations like resolving a promise chain. This queue is always drained
-;;       completely before handling I/O or other tasks, ensuring that promise
-;;       state propagates without delay.
-;;     - **Macrotask Scheduler:** A lower-priority queue for user-provided
-;;       callbacks (e.g., from `.then`, `.catch`). These tasks are processed
-;;       in batches during idle time to avoid blocking the user interface.
+;; 2.  **Task Scheduling:** Implements and manages two distinct schedulers to
+;;     comply with Promise/A+ specifications for execution order:
+;;     - **Microtask Queue:** A high-priority queue for immediate, internal
+;;       operations like resolving a promise chain. This queue is always drained
+;;       completely before handling I/O or other tasks, ensuring that promise
+;;       state propagates without delay.
+;;     - **Macrotask Scheduler:** A lower-priority queue for user-provided
+;;       callbacks (e.g., from `.then`, `.catch`). These tasks are processed
+;;       in batches during idle time to avoid blocking the user interface.
 ;;
-;; 3.  **System Coordination:** It initializes and coordinates with other Loom
-;;     subsystems, particularly the Inter-Process/Thread Communication (IPC)
-;;     module (`loom-ipc.el`), which is essential for settling promises from
-;;     background threads or external processes.
+;; 3.  **System Coordination:** It initializes and coordinates with other Loom
+;;     subsystems, particularly the Inter-Process/Thread Communication (IPC)
+;;     module (`loom-ipc.el`), which is essential for settling promises from
+;;     background threads or external processes.
+;;
+;; 4.  **Health Monitoring:** Optionally provides periodic health checks,
+;;     outputting a consolidated status report of various Loom components
+;;     to the `*Messages*` buffer. This aids in debugging and system oversight.
 ;;
 ;; ## Basic Usage
 ;;
 ;; Before using any promise features, the library must be initialized once:
 ;;
-;;   (loom:init)
+;; (loom:init)
 ;;
 ;; The library will automatically register a hook to call `loom:shutdown`
 ;; when Emacs exits, ensuring all resources are cleaned up gracefully.
@@ -49,12 +53,22 @@
 (require 'loom-scheduler)
 (require 'loom-microtask)
 (require 'loom-ipc)
-(require 'loom-thread-polling)
+(require 'loom-thread-polling) ; Required for periodic health checks
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Forward Declarations
 
 (declare-function loom-execute-callback "loom-callback")
+;; Status functions from other modules
+(declare-function loom:error-statistics "loom-errors")
+(declare-function loom:lock-global-stats "loom-lock")
+(declare-function loom:microtask-status "loom-microtask")
+(declare-function loom:scheduler-status "loom-scheduler")
+(declare-function loom:thread-polling-scheduler-status "loom-thread-polling")
+(declare-function loom:thread-polling-system-health-report "loom-thread-polling")
+(declare-function loom:registry-status "loom-registry")
+(declare-function loom:registry-metrics "loom-registry")
+
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Global State
@@ -81,27 +95,111 @@ specifications (like those for JavaScript and Promise/A+), the microtask
 queue must be drained completely before processing any other events,
 ensuring the atomicity of promise state transitions.")
 
+(defvar loom--health-check-timer nil
+  "Internal timer for the periodic health check.")
+
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Internal Helpers
+;;; Customization
 
-(cl-defun loom--ensure-callback (task &key (type :deferred) (priority 50) data)
-  "Ensures `TASK` is a `loom-callback` struct, creating one if not.
-This utility function normalizes tasks submitted to schedulers, allowing
-users to submit raw functions while the schedulers work with a consistent
-`loom-callback` struct internally.
+(defcustom loom-health-check-enable t
+  "If non-nil, periodically output Loom's system status as a health check."
+  :type 'boolean
+  :group 'loom)
 
-Arguments:
-- `TASK` (function or loom-callback): The task to convert or validate.
-- `:TYPE` (symbol): The callback type to assign if a new struct is created.
-- `:PRIORITY` (integer): The priority to assign if a new struct is created.
-- `:DATA` (plist): The data to associate if a new struct is created.
+(defcustom loom-health-check-interval 30
+  "Interval in seconds for the periodic health check output."
+  :type '(integer :min 1)
+  :group 'loom)
 
-Returns: A valid `loom-callback` struct."
-  (cond
-   ((loom-callback-p task) task)
-   ((functionp task)
-    (loom:callback task :type type :priority priority :data data))
-   (t (signal 'wrong-type-argument `(or functionp loom-callback-p ,task)))))
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Internal Helpers: Health Checks
+
+(defun loom--indent-multiline-string (str indent-level)
+  "Indents every line of a multi-line string by `INDENT-LEVEL` spaces.
+  This helper is used for formatting health check reports to ensure
+  consistent visual alignment in the logs.
+
+  Arguments:
+  - `STR` (string): The string to indent. It may contain multiple lines
+    separated by newline characters.
+  - `INDENT-LEVEL` (integer): The number of spaces to prepend to each line.
+
+  Returns:
+  - (string): The newly indented string."
+  (when str
+    (let ((indent-prefix (make-string indent-level ?\s)))
+      ;; Prepend indent to the first line, then replace all other newlines
+      ;; with a newline followed by the indent prefix.
+      (s-replace-regexp "^" indent-prefix
+                        (s-replace-regexp "\n" (concat "\n" indent-prefix) str)))))
+
+(defun loom--perform-health-check ()
+  "Collects and logs a comprehensive status report of Loom's components.
+  This function is intended to be called periodically as a health check.
+  It queries various Loom modules for their status and presents them
+  in a formatted, consolidated log entry for easy monitoring.
+
+  Side Effects:
+  - Outputs a multi-line log message to the `*Messages*` buffer or
+    configured `loom-log-buffer`."
+  (let* ((base-indent 4)        ; Indentation for the main report blocks
+         (line-indent 4)        ; Additional indentation for each status line
+         (total-indent (+ base-indent line-indent))
+         ;; Build a list of unindented, raw formatted status strings.
+         ;; The function calls are evaluated directly here.
+         (raw-status-lines
+          (list
+           (format "Error Stats: %S" (loom:error-statistics))
+           (format "Lock Stats: %S" (loom:lock-global-stats))
+           (format "Microtask Queue Status: %S"
+                   (loom:microtask-status loom--microtask-scheduler))
+           (format "Macrotask Scheduler Status: %S"
+                   (loom:scheduler-status loom--macrotask-scheduler))
+           (format "Thread Polling Scheduler Status: %S"
+                   (loom:thread-polling-scheduler-status))
+           (format "Thread Polling System Health: %S"
+                   (loom:thread-polling-system-health-report))
+           (format "Promise Registry Status: %S" (loom:registry-status))
+           (format "Promise Registry Metrics: %S" (loom:registry-metrics)))))
+
+    ;; Map over the raw status lines to apply the indentation.
+    (let ((indented-report-lines
+           (--map (loom--indent-multiline-string it total-indent)
+                  raw-status-lines)))
+
+      ;; Combine all generated report lines with header and footer.
+      (loom-log :info nil
+                (string-join
+                 (append (list (loom--indent-multiline-string
+                                "--- Loom System Health Check ---" base-indent))
+                         indented-report-lines
+                         (list (loom--indent-multiline-string
+                                "--- End Health Check ---" base-indent)))
+                 "\n")))))
+
+(defun loom--start-health-check-timer ()
+  "Starts the periodic health check timer if enabled."
+  (when (and loom-health-check-enable
+             (not (timerp loom--health-check-timer))
+             (> loom-health-check-interval 0))
+    (loom-log :info nil
+              "Starting Loom health check timer (interval: %ds)."
+              loom-health-check-interval)
+    (setq loom--health-check-timer
+          ;; Use run-with-timer for simplicity here, as it's just logging.
+          (run-with-timer loom-health-check-interval
+                          loom-health-check-interval
+                          #'loom--perform-health-check))))
+
+(defun loom--stop-health-check-timer ()
+  "Stops the periodic health check timer."
+  (when (timerp loom--health-check-timer)
+    (loom-log :info nil "Stopping Loom health check timer.")
+    (cancel-timer loom--health-check-timer)
+    (setq loom--health-check-timer nil)))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Internal Helpers: Macrotask and Microtask Schedulers
 
 (defun loom--callback-fifo-priority (cb-a cb-b)
   "A comparator function for the macrotask scheduler's priority queue.
@@ -158,7 +256,7 @@ Returns: `nil`."
         ;; This inner condition-case makes the handler itself robust.
         (error
          (loom-log :error nil
-                   "Error while handling overflow for callback %S: %S" cb err))))
+                   "Error while handling overflow for callback %S: %S" cb err)))))
   nil)
 
 (defun loom--init-schedulers ()
@@ -205,7 +303,7 @@ Signals: `loom-initialization-error` on failure."
   nil)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Public API
+;;; Public API: Scheduling
 
 ;;;###autoload
 (defun loom:scheduler-tick ()
@@ -266,9 +364,9 @@ Signals: `loom-scheduler-error` if the scheduler is not initialized."
   (unless loom--macrotask-scheduler
     (signal 'loom-scheduler-error '("Macrotask scheduler not initialized.")))
   ;; Ensure the task is a callback struct before enqueuing.
-  (let ((callback (loom--ensure-callback task
-                                         :type :deferred
-                                         :priority priority)))
+  (let ((callback (loom:ensure-callback task
+                                        :type :deferred
+                                        :priority priority)))
     (condition-case err
         (loom:scheduler-enqueue loom--macrotask-scheduler callback)
       (error (signal 'loom-scheduler-error
@@ -290,11 +388,14 @@ Returns: `nil`.
 Signals: `loom-scheduler-error` if the scheduler is not initialized."
   (unless loom--microtask-scheduler
     (signal 'loom-scheduler-error '("Microtask scheduler not initialized.")))
-  (let ((callback (loom--ensure-callback task :priority priority)))
+  (let ((callback (loom:ensure-callback task :priority priority)))
     (condition-case err
         (loom:microtask-enqueue loom--microtask-scheduler callback)
       (error (signal 'loom-scheduler-error `("Failed to enqueue microtask" ,err)))))
   nil)
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Public API: Initialization/Shutdown
 
 ;;;###autoload
 (defun loom:init ()
@@ -312,6 +413,9 @@ Signals: `loom-initialization-error` on a non-recoverable failure."
           ;; Initialize subsystems in order of dependency.
           (loom--init-schedulers)
           (loom:ipc-init)
+          (when (fboundp 'make-thread) ; Start thread polling scheduler if threads available
+            (loom:thread-polling-ensure-scheduler-thread))
+          (loom--start-health-check-timer) ; Start health check after all systems are up
 
           ;; Mark initialization as complete.
           (setq loom--initialized t)
@@ -323,7 +427,7 @@ Signals: `loom-initialization-error` on a non-recoverable failure."
        ;; partially initialized to leave the system in a clean state.
        (loom:shutdown)
        ;; ...and signal a specific error to the caller.
-       (signal 'loom-initial-ization-error `("Library init failed" ,err)))))
+       (signal 'loom-initialization-error `("Library init failed" ,err)))))
   nil)
 
 ;;;###autoload
@@ -342,6 +446,9 @@ Returns: `nil`."
         (progn
           ;; The following cleanup steps are individually wrapped to maximize
           ;; the chance of a complete shutdown.
+
+          ;; Stop and clean up the health check timer
+          (loom--stop-health-check-timer)
 
           ;; 1. Signal the generic thread polling scheduler to stop.
           (condition-case e (loom:thread-polling-stop-scheduler-thread)
