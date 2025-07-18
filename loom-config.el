@@ -1,4 +1,4 @@
-;;; loom-config.el --- Core functionality for Concur Promises -*- lexical-binding: t; -*-
+;;; loom-config.el --- Core functionality for Loom Promises -*- lexical-binding: t; -*-
 
 ;;; Commentary:
 ;;
@@ -34,13 +34,15 @@
 ;;
 ;; ## Basic Usage
 ;;
-;; Before using any promise features, the library must be initialized once:
+;; Before using any promise features, the library must be initialized once.
+;; This can be a simple call for in-process concurrency, or it can be
+;; configured for communication with other Emacs instances.
 ;;
-;; (loom:init)
+;; (loom:init) ;; For standard, in-process use.
 ;;
-;; The scheduler is run cooperatively by the promise machinery itself. The
-;; library will automatically register a hook to call `loom:shutdown` when
-;; Emacs exits, ensuring all resources are cleaned up gracefully.
+;; (loom:init :my-id "server" :listen-for-incoming-p t) ;; As an IPC server.
+;;
+;; (loom:init :my-id "client" :target-instance-id "server") ;; As an IPC client.
 
 ;;; Code:
 
@@ -422,7 +424,7 @@ Signals:
 ;;; Public API: Initialization/Shutdown
 
 ;;;###autoload
-(defun loom:init ()
+(cl-defun loom:init (&key my-id target-instance-id (listen-for-incoming-p t))
   "Initialize the entire Loom concurrency library.
 This function sets up the global schedulers, IPC mechanisms, and other
 core resources required for asynchronous operations. It is idempotent,
@@ -430,7 +432,17 @@ meaning it is safe to call multiple times; it will only perform the
 initialization once. This function must be called before any other
 Loom API function is used.
 
-Returns: `nil`.
+Arguments:
+- `:MY-ID` (string, optional): A unique string identifier for this
+  Emacs instance, used for naming its input FIFO. Defaults to the
+  current process ID.
+- `:TARGET-INSTANCE-ID` (string, optional): The ID of the target Emacs
+  instance for sending messages. If non-nil, an output pipe is created.
+- `:LISTEN-FOR-INCOMING-P` (boolean, optional): If t (the default),
+  create an input pipe to receive messages from other processes.
+
+Returns:
+- `nil`.
 
 Side Effects:
 - Modifies global state variables (`loom--initialized`, schedulers, etc.).
@@ -448,7 +460,9 @@ Signals:
         (progn
           ;; Initialize subsystems in order of dependency.
           (loom--init-schedulers)
-          (loom:ipc-init)
+          (loom:ipc-init :my-id my-id
+                         :target-instance-id target-instance-id
+                         :listen-for-incoming-p listen-for-incoming-p)
           (when (fboundp 'make-thread)
             (loom:poll-ensure-scheduler-thread))
           (loom--start-health-check-timer)

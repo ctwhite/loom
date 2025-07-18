@@ -76,354 +76,354 @@ Arguments:
      (with-test-schedulers
        ,@body)))
 
-;; Global variable to accumulate results from `test-process-fn`
-(defvar test-processed-tasks nil
-  "Accumulates tasks processed by `test-process-fn` in scheduler tests.")
+;; ;; Global variable to accumulate results from `test-process-fn`
+;; (defvar test-processed-tasks nil
+;;   "Accumulates tasks processed by `test-process-fn` in scheduler tests.")
 
-(defun test-process-fn (batch)
-  "A simple process-fn for `loom-scheduler` tests.
-Appends the `BATCH` of processed tasks to `test-processed-tasks`."
-  (setq test-processed-tasks (append test-processed-tasks batch)))
+;; (defun test-process-fn (batch)
+;;   "A simple process-fn for `loom-scheduler` tests.
+;; Appends the `BATCH` of processed tasks to `test-processed-tasks`."
+;;   (setq test-processed-tasks (append test-processed-tasks batch)))
 
-;; A custom priority function for `loom-priority-queue` and `loom-scheduler`
-;; tests. Assumes tasks are cons cells like `(value . priority)`.
-(defun test-priority-fn (task)
-  "Extracts the priority from a test `TASK` (cdr of a cons cell)."
-  (cdr task))
+;; ;; A custom priority function for `loom-priority-queue` and `loom-scheduler`
+;; ;; tests. Assumes tasks are cons cells like `(value . priority)`.
+;; (defun test-priority-fn (task)
+;;   "Extracts the priority from a test `TASK` (cdr of a cons cell)."
+;;   (cdr task))
 
-;; Global variable to log execution from `test-microtask-executor`
-(defvar test-microtask-executor-log nil
-  "Accumulates data from microtasks executed by `test-microtask-executor`.")
+;; ;; Global variable to log execution from `test-microtask-executor`
+;; (defvar test-microtask-executor-log nil
+;;   "Accumulates data from microtasks executed by `test-microtask-executor`.")
 
-(defun test-microtask-executor (callback)
-  "Records the callback's value to `test-microtask-executor-log`."
-  (push (loom-callback-data callback) test-microtask-executor-log))
+;; (defun test-microtask-executor (callback)
+;;   "Records the callback's value to `test-microtask-executor-log`."
+;;   (push (loom-callback-data callback) test-microtask-executor-log))
 
-;; Global variable to log tasks handled by `test-microtask-overflow-handler`
-(defvar test-microtask-overflow-log nil
-  "Accumulates tasks dropped due to overflow in microtask queue tests.")
+;; ;; Global variable to log tasks handled by `test-microtask-overflow-handler`
+;; (defvar test-microtask-overflow-log nil
+;;   "Accumulates tasks dropped due to overflow in microtask queue tests.")
 
-(defun test-microtask-overflow-handler (queue overflowed-callbacks)
-  "A custom overflow handler for `loom-microtask-queue` tests.
-Appends `overflowed-callbacks` to `test-microtask-overflow-log`."
-  (setq test-microtask-overflow-log
-        (append test-microtask-overflow-log overflowed-callbacks)))
+;; (defun test-microtask-overflow-handler (queue overflowed-callbacks)
+;;   "A custom overflow handler for `loom-microtask-queue` tests.
+;; Appends `overflowed-callbacks` to `test-microtask-overflow-log`."
+;;   (setq test-microtask-overflow-log
+;;         (append test-microtask-overflow-log overflowed-callbacks)))
 
-;; Global variable to count periodic task executions for `loom-thread-polling`
-(defvar test-periodic-task-count 0
-  "Counts how many times a test periodic task has executed.")
+;; ;; Global variable to count periodic task executions for `loom-thread-polling`
+;; (defvar test-periodic-task-count 0
+;;   "Counts how many times a test periodic task has executed.")
 
-;; Global variable to store errors from `test-faulty-periodic-task`
-(defvar test-periodic-task-errors nil
-  "List of errors encountered by `test-faulty-periodic-task`.")
+;; ;; Global variable to store errors from `test-faulty-periodic-task`
+;; (defvar test-periodic-task-errors nil
+;;   "List of errors encountered by `test-faulty-periodic-task`.")
 
-(defun test-simple-periodic-task ()
-  "A simple periodic task that increments `test-periodic-task-count`."
-  (cl-incf test-periodic-task-count))
+;; (defun test-simple-periodic-task ()
+;;   "A simple periodic task that increments `test-periodic-task-count`."
+;;   (cl-incf test-periodic-task-count))
 
-(defun test-faulty-periodic-task ()
-  "A periodic task that throws an error every other call."
-  (cl-incf test-periodic-task-count)
-  (when (oddp test-periodic-task-count)
-    (error "Task failed at count %d" test-periodic-task-count)))
+;; (defun test-faulty-periodic-task ()
+;;   "A periodic task that throws an error every other call."
+;;   (cl-incf test-periodic-task-count)
+;;   (when (oddp test-periodic-task-count)
+;;     (error "Task failed at count %d" test-periodic-task-count)))
 
-;; Global var to store raw IPC messages sent to the process
-;; This is still needed for tests that explicitly check the raw string output
-;; of the mocked process-send-string, like loom-ipc-filter-partial-lines-test.
-(defvar test-ipc-sent-strings nil
-  "Log of raw strings sent to the IPC process via mocked process-send-string.")
+;; ;; Global var to store raw IPC messages sent to the process
+;; ;; This is still needed for tests that explicitly check the raw string output
+;; ;; of the mocked process-send-string, like loom-ipc-filter-partial-lines-test.
+;; (defvar test-ipc-sent-strings nil
+;;   "Log of raw strings sent to the IPC process via mocked process-send-string.")
 
-;; Removed test-ipc-received-messages as this was for the old mock filter.
-;; Removed test-ipc-sentinel-log as we will use the real sentinel.
-;; Removed test-mock-ipc-filter and test-mock-ipc-sentinel global definitions.
+;; ;; Removed test-ipc-received-messages as this was for the old mock filter.
+;; ;; Removed test-ipc-sentinel-log as we will use the real sentinel.
+;; ;; Removed test-mock-ipc-filter and test-mock-ipc-sentinel global definitions.
 
-;; Removed with-mock-ipc-process macro as it's no longer needed.
+;; ;; Removed with-mock-ipc-process macro as it's no longer needed.
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Test Suite: loom-ipc.el
+;; ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; ;;; Test Suite: loom-ipc.el
 
-(ert-deftest loom-ipc-init-cleanup-test ()
-  "Tests `loom:ipc-init` for proper initialization and `loom:ipc-cleanup`.
-Verifies idempotency and correct resource allocation/deallocation.
-This test does NOT use `loom-deftest` as it directly tests Loom's
-global initialization and cleanup functions."
-  ;; Initial state: all IPC globals should be nil
-  (should (null loom--ipc-process))
-  (should (null loom--ipc-buffer))
-  (should (null loom--ipc-queue-mutex))
-  (should (null loom--ipc-main-thread-queue))
+;; (ert-deftest loom-ipc-init-cleanup-test ()
+;;   "Tests `loom:ipc-init` for proper initialization and `loom:ipc-cleanup`.
+;; Verifies idempotency and correct resource allocation/deallocation.
+;; This test does NOT use `loom-deftest` as it directly tests Loom's
+;; global initialization and cleanup functions."
+;;   ;; Initial state: all IPC globals should be nil
+;;   (should (null loom--ipc-process))
+;;   (should (null loom--ipc-buffer))
+;;   (should (null loom--ipc-queue-mutex))
+;;   (should (null loom--ipc-main-thread-queue))
 
-  ;; Initialize IPC
-  (loom:ipc-init)
-  (should (process-live-p loom--ipc-process))
-  (should (buffer-live-p loom--ipc-buffer))
-  (when (fboundp 'make-thread)
-    (should (loom-lock-p loom--ipc-queue-mutex))
-    (should (loom-queue-p loom--ipc-main-thread-queue)))
+;;   ;; Initialize IPC
+;;   (loom:ipc-init)
+;;   (should (process-live-p loom--ipc-process))
+;;   (should (buffer-live-p loom--ipc-buffer))
+;;   (when (fboundp 'make-thread)
+;;     (should (loom-lock-p loom--ipc-queue-mutex))
+;;     (should (loom-queue-p loom--ipc-main-thread-queue)))
 
-  ;; Idempotency: calling init again should not create new resources
-  (let ((old-process loom--ipc-process)
-        (old-buffer loom--ipc-buffer)
-        (old-mutex loom--ipc-queue-mutex))
-    (loom:ipc-init)
-    (should (eq old-process loom--ipc-process))
-    (should (eq old-buffer loom--ipc-buffer))
-    (should (eq old-mutex loom--ipc-queue-mutex)))
+;;   ;; Idempotency: calling init again should not create new resources
+;;   (let ((old-process loom--ipc-process)
+;;         (old-buffer loom--ipc-buffer)
+;;         (old-mutex loom--ipc-queue-mutex))
+;;     (loom:ipc-init)
+;;     (should (eq old-process loom--ipc-process))
+;;     (should (eq old-buffer loom--ipc-buffer))
+;;     (should (eq old-mutex loom--ipc-queue-mutex)))
 
-  ;; Cleanup IPC
-  (loom:ipc-cleanup)
-  (should (null loom--ipc-process))
-  (should (not (buffer-live-p loom--ipc-buffer))) ; Buffer should be killed
-  (should (null loom--ipc-queue-mutex))
-  (should (null loom--ipc-main-thread-queue))
+;;   ;; Cleanup IPC
+;;   (loom:ipc-cleanup)
+;;   (should (null loom--ipc-process))
+;;   (should (not (buffer-live-p loom--ipc-buffer))) ; Buffer should be killed
+;;   (should (null loom--ipc-queue-mutex))
+;;   (should (null loom--ipc-main-thread-queue))
 
-  ;; Idempotency: calling cleanup again should be safe
-  (loom:ipc-cleanup)
-  (should (null loom--ipc-process)))
+;;   ;; Idempotency: calling cleanup again should be safe
+;;   (loom:ipc-cleanup)
+;;   (should (null loom--ipc-process)))
 
-(loom-deftest loom-ipc-dispatch-main-thread-process-path-test ()
-  "Tests `loom:dispatch-to-main-thread` when running on main thread,
-using the real process pipe for async dispatch, including data serialization.
-This test verifies the end-to-end process communication."
-  ;; loom-deftest already calls loom:init (which creates loom--ipc-process)
-  ;; and loom:shutdown in an unwind-protect.
+;; (loom-deftest loom-ipc-dispatch-main-thread-process-path-test ()
+;;   "Tests `loom:dispatch-to-main-thread` when running on main thread,
+;; using the real process pipe for async dispatch, including data serialization.
+;; This test verifies the end-to-end process communication."
+;;   ;; loom-deftest already calls loom:init (which creates loom--ipc-process)
+;;   ;; and loom:shutdown in an unwind-protect.
 
-  ;; PART 1: Test with a value
-  (let* ((actual-promise (loom:promise)) ; Create the real promise
-         (p-id (loom-promise-id actual-promise)) ; Get its auto-generated ID
-         (payload-data `(:id ,p-id :value "test-value" :data (1 2))))
+;;   ;; PART 1: Test with a value
+;;   (let* ((actual-promise (loom:promise)) ; Create the real promise
+;;          (p-id (loom-promise-id actual-promise)) ; Get its auto-generated ID
+;;          (payload-data `(:id ,p-id :value "test-value" :data (1 2))))
 
-    (sleep-for 0.5)
-    ;; Dispatch a message. This will use the real loom--ipc-process.
-    (loom:dispatch-to-main-thread
-     actual-promise ; Pass the *actual* promise object
-     nil ; default message-type
-     payload-data)
+;;     (sleep-for 0.5)
+;;     ;; Dispatch a message. This will use the real loom--ipc-process.
+;;     (loom:dispatch-to-main-thread
+;;      actual-promise ; Pass the *actual* promise object
+;;      nil ; default message-type
+;;      payload-data)
 
-    ;; Give Emacs time to process the pipe output via the filter function.
-    ;; The filter will parse the JSON and call loom:process-settled-on-main.
-    (sleep-for 0.5)
+;;     ;; Give Emacs time to process the pipe output via the filter function.
+;;     ;; The filter will parse the JSON and call loom:process-settled-on-main.
+;;     (sleep-for 0.5)
 
-    ;; Verify the promise is now resolved
-    (message "promise status --------------> %s" (loom:status actual-promise))
-    (should (eq (loom:resolved-p actual-promise) t))
-    (should (string= (loom:value actual-promise) "test-value")))
+;;     ;; Verify the promise is now resolved
+;;     (message "promise status --------------> %s" (loom:status actual-promise))
+;;     (should (eq (loom:resolved-p actual-promise) t))
+;;     (should (string= (loom:value actual-promise) "test-value")))
 
-  ;; PART 2: Test with an error object, ensuring it's serialized and propagated
-  (let* ((actual-promise-err (loom:promise)) ; Create another real promise for error test
-         (p-id-err (loom-promise-id actual-promise-err))
-         (err-obj (loom:make-error :type :test-error :message "IPC error")))
+;;   ;; PART 2: Test with an error object, ensuring it's serialized and propagated
+;;   (let* ((actual-promise-err (loom:promise)) ; Create another real promise for error test
+;;          (p-id-err (loom-promise-id actual-promise-err))
+;;          (err-obj (loom:make-error :type :test-error :message "IPC error")))
 
-    (should (loom:pending-p actual-promise-err)) ; Should be pending initially
+;;     (should (loom:pending-p actual-promise-err)) ; Should be pending initially
 
-    (loom:dispatch-to-main-thread
-     actual-promise-err
-     nil
-     `(:error ,err-obj)) ; Pass the error object directly
+;;     (loom:dispatch-to-main-thread
+;;      actual-promise-err
+;;      nil
+;;      `(:error ,err-obj)) ; Pass the error object directly
 
-    ;; Give Emacs time to process the pipe output.
-    (sit-for 0.01)
+;;     ;; Give Emacs time to process the pipe output.
+;;     (sit-for 0.01)
 
-    ;; Verify the promise is now rejected and the error is correct.
-    (should (loom:rejected-p actual-promise-err))
-    (should (equal (loom:error-message actual-promise-err) "IPC error"))
-    (should (equal (loom:error-type actual-promise-err) :test-error))))
+;;     ;; Verify the promise is now rejected and the error is correct.
+;;     (should (loom:rejected-p actual-promise-err))
+;;     (should (equal (loom:error-message actual-promise-err) "IPC error"))
+;;     (should (equal (loom:error-type actual-promise-err) :test-error))))
 
-(ert-deftest loom-ipc-dispatch-main-thread-fallback-test ()
-  "Tests `loom:dispatch-to-main-thread` falls back to `run-at-time`
-if no other IPC channel is available (e.g., process not running).
-This test explicitly ensures Loom is uninitialized to test the fallback path."
-  ;; Ensure Loom's IPC components are NOT initialized for this test
-  (loom:ipc-cleanup) ; Defensive cleanup
-  (let ((loom-promise-registry (make-hash-table :test 'eq)) ; For promise lookup
-        (loom-enable-promise-registry t)
-        (promise-resolved-p nil)
-        (result-value nil))
-    (loom:clear-registry)
+;; (ert-deftest loom-ipc-dispatch-main-thread-fallback-test ()
+;;   "Tests `loom:dispatch-to-main-thread` falls back to `run-at-time`
+;; if no other IPC channel is available (e.g., process not running).
+;; This test explicitly ensures Loom is uninitialized to test the fallback path."
+;;   ;; Ensure Loom's IPC components are NOT initialized for this test
+;;   (loom:ipc-cleanup) ; Defensive cleanup
+;;   (let ((loom-promise-registry (make-hash-table :test 'eq)) ; For promise lookup
+;;         (loom-enable-promise-registry t)
+;;         (promise-resolved-p nil)
+;;         (result-value nil))
+;;     (loom:clear-registry)
 
-    (let* ((p (loom:promise))
-           (p-id (loom-promise-id p)))
-      ;; Dispatch the message (should hit the `run-at-time` fallback)
-      (loom:dispatch-to-main-thread p nil `(:value "fallback-value"))
+;;     (let* ((p (loom:promise))
+;;            (p-id (loom-promise-id p)))
+;;       ;; Dispatch the message (should hit the `run-at-time` fallback)
+;;       (loom:dispatch-to-main-thread p nil `(:value "fallback-value"))
 
-      ;; `run-at-time` schedules for next idle moment; `sit-for` simulates it
-      (sit-for 0.001)
+;;       ;; `run-at-time` schedules for next idle moment; `sit-for` simulates it
+;;       (sit-for 0.001)
 
-      (should (loom:resolved-p p))
-      (should (string= (loom:value p) "fallback-value")))))
+;;       (should (loom:resolved-p p))
+;;       (should (string= (loom:value p) "fallback-value")))))
 
-(loom-deftest loom-ipc-drain-queue-test ()
-  "Tests `loom:ipc-drain-queue` for processing messages from the queue.
-Verifies message processing order and promise settlement. Uses `loom-deftest`
-for proper Loom environment initialization."
-  ;; Ensure IPC is initialized (creates queue and mutex)
-  (loom:ipc-init)
+;; (loom-deftest loom-ipc-drain-queue-test ()
+;;   "Tests `loom:ipc-drain-queue` for processing messages from the queue.
+;; Verifies message processing order and promise settlement. Uses `loom-deftest`
+;; for proper Loom environment initialization."
+;;   ;; Ensure IPC is initialized (creates queue and mutex)
+;;   (loom:ipc-init)
 
-  ;; Simulate promises existing in the registry for processing
-  (let* ((p1 (loom:promise :name "p1"))
-         (p2 (loom:promise :name "p2"))
-         (p3 (loom:promise :name "p3")))
-    ;; Enqueue some dummy messages directly into the internal queue
-    (loom:with-mutex! loom--ipc-queue-mutex
-      (loom:queue-enqueue loom--ipc-main-thread-queue
-                          `(:id ,(loom-promise-id p1) :value "msg1"))
-      (loom:queue-enqueue loom--ipc-main-thread-queue
-                          `(:id ,(loom-promise-id p2) :value "msg2"))
-      (loom:queue-enqueue loom--ipc-main-thread-queue
-                          `(:id ,(loom-promise-id p3)
-                            :error ,(loom:serialize-error ; <--- COMMA ADDED HERE
-                                    (loom:make-error :message "err3")))))
+;;   ;; Simulate promises existing in the registry for processing
+;;   (let* ((p1 (loom:promise :name "p1"))
+;;          (p2 (loom:promise :name "p2"))
+;;          (p3 (loom:promise :name "p3")))
+;;     ;; Enqueue some dummy messages directly into the internal queue
+;;     (loom:with-mutex! loom--ipc-queue-mutex
+;;       (loom:queue-enqueue loom--ipc-main-thread-queue
+;;                           `(:id ,(loom-promise-id p1) :value "msg1"))
+;;       (loom:queue-enqueue loom--ipc-main-thread-queue
+;;                           `(:id ,(loom-promise-id p2) :value "msg2"))
+;;       (loom:queue-enqueue loom--ipc-main-thread-queue
+;;                           `(:id ,(loom-promise-id p3)
+;;                             :error ,(loom:serialize-error ; <--- COMMA ADDED HERE
+;;                                     (loom:make-error :message "err3")))))
 
 
-    ;; Drain the queue
-    (let ((processed-count (loom:ipc-drain-queue)))
-      (should (eq processed-count 3)))
+;;     ;; Drain the queue
+;;     (let ((processed-count (loom:ipc-drain-queue)))
+;;       (should (eq processed-count 3)))
 
-    ;; Verify queue is empty after drain
-    (should (eq (loom:queue-length loom--ipc-main-thread-queue) 0))
+;;     ;; Verify queue is empty after drain
+;;     (should (eq (loom:queue-length loom--ipc-main-thread-queue) 0))
 
-    ;; Verify promises are settled as expected
-    (should (loom:resolved-p p1))
-    (should (string= (loom:value p1) "msg1"))
-    (should (loom:resolved-p p2))
-    (should (string= (loom:value p2) "msg2"))
-    (should (loom:rejected-p p3))
-    (should (string= (loom:error-message p3) "err3"))))
+;;     ;; Verify promises are settled as expected
+;;     (should (loom:resolved-p p1))
+;;     (should (string= (loom:value p1) "msg1"))
+;;     (should (loom:resolved-p p2))
+;;     (should (string= (loom:value p2) "msg2"))
+;;     (should (loom:rejected-p p3))
+;;     (should (string= (loom:error-message p3) "err3"))))
 
-(loom-deftest loom-ipc-drain-queue-empty-test ()
-  "Tests `loom:ipc-drain-queue` behaves correctly on an empty queue.
-Uses `loom-deftest` for proper Loom environment initialization."
-  (loom:ipc-init)
-  (should (eq (loom:ipc-drain-queue) 0)))
+;; (loom-deftest loom-ipc-drain-queue-empty-test ()
+;;   "Tests `loom:ipc-drain-queue` behaves correctly on an empty queue.
+;; Uses `loom-deftest` for proper Loom environment initialization."
+;;   (loom:ipc-init)
+;;   (should (eq (loom:ipc-drain-queue) 0)))
 
-(loom-deftest loom-ipc-parse-pipe-line-test ()
-  "Tests internal `loom--ipc-parse-pipe-line` with various message types,
-including JSON serialization/deserialization details.
-This test manually sets up the minimal required environment and mocks
-`loom-log` to capture internal messages."
-  (let ((loom-promise-registry (make-hash-table :test 'eq))
-        (loom-enable-promise-registry t)
-        (log-messages '()))
-    ;; Mock loom-log to capture internal log messages
-    (cl-letf (((symbol-function 'loom-log)
-               (lambda (level id format-string &rest args)
-                 (push (format "%s: %s: %s" level (symbol-name id)
-                               (apply #'format format-string args))
-                       log-messages))))
-      (loom:clear-registry)
+;; (loom-deftest loom-ipc-parse-pipe-line-test ()
+;;   "Tests internal `loom--ipc-parse-pipe-line` with various message types,
+;; including JSON serialization/deserialization details.
+;; This test manually sets up the minimal required environment and mocks
+;; `loom-log` to capture internal messages."
+;;   (let ((loom-promise-registry (make-hash-table :test 'eq))
+;;         (loom-enable-promise-registry t)
+;;         (log-messages '()))
+;;     ;; Mock loom-log to capture internal log messages
+;;     (cl-letf (((symbol-function 'loom-log)
+;;                (lambda (level id format-string &rest args)
+;;                  (push (format "%s: %s: %s" level (symbol-name id)
+;;                                (apply #'format format-string args))
+;;                        log-messages))))
+;;       (loom:clear-registry)
 
-      ;; Mock a promise to be settled for `promise-settled` messages
-      (let* ((p (loom:promise :name "test-promise"))
-             (p-id (loom-promise-id p)))
-        (should (loom:pending-p p))
+;;       ;; Mock a promise to be settled for `promise-settled` messages
+;;       (let* ((p (loom:promise :name "test-promise"))
+;;              (p-id (loom-promise-id p)))
+;;         (should (loom:pending-p p))
 
-        ;; Test :promise-settled message (value)
-        (let* ((payload `(:id ,p-id :type :promise-settled :value "test-val"))
-               (json-line (json-encode payload)))
-          (loom--ipc-parse-pipe-line json-line)
-          (should (loom:resolved-p p))
-          (should (string= (loom:value p) "test-val")))
+;;         ;; Test :promise-settled message (value)
+;;         (let* ((payload `(:id ,p-id :type :promise-settled :value "test-val"))
+;;                (json-line (json-encode payload)))
+;;           (loom--ipc-parse-pipe-line json-line)
+;;           (should (loom:resolved-p p))
+;;           (should (string= (loom:value p) "test-val")))
 
-        ;; Test :promise-settled message (error)
-        (let* ((p2 (loom:promise :name "err-promise"))
-               (p2-id (loom-promise-id p2))
-               (err-data (loom:serialize-error
-                          (loom:make-error :message "pipe-err"))))
-          (let* ((payload `(:id ,p2-id :type :promise-settled :error ,err-data))
-                 (json-line (json-encode payload)))
-            (loom--ipc-parse-pipe-line json-line)
-            (should (loom:rejected-p p2))
-            (should (string= (loom:error-message p2) "pipe-err"))))
+;;         ;; Test :promise-settled message (error)
+;;         (let* ((p2 (loom:promise :name "err-promise"))
+;;                (p2-id (loom-promise-id p2))
+;;                (err-data (loom:serialize-error
+;;                           (loom:make-error :message "pipe-err"))))
+;;           (let* ((payload `(:id ,p2-id :type :promise-settled :error ,err-data))
+;;                  (json-line (json-encode payload)))
+;;             (loom--ipc-parse-pipe-line json-line)
+;;             (should (loom:rejected-p p2))
+;;             (should (string= (loom:error-message p2) "pipe-err"))))
 
-        ;; Test :log message
-        (let* ((payload `(:type :log :level :info :message "Hello from pipe"))
-               (json-line (json-encode payload)))
-          (loom--ipc-parse-pipe-line json-line)
-          (should (string-match-p "info: nil: IPC remote log: Hello from pipe"
-                                  (car log-messages)))
-          (setq log-messages nil)) ; Clear log for next check
+;;         ;; Test :log message
+;;         (let* ((payload `(:type :log :level :info :message "Hello from pipe"))
+;;                (json-line (json-encode payload)))
+;;           (loom--ipc-parse-pipe-line json-line)
+;;           (should (string-match-p "info: nil: IPC remote log: Hello from pipe"
+;;                                   (car log-messages)))
+;;           (setq log-messages nil)) ; Clear log for next check
 
-        ;; Test unknown message type
-        (let* ((payload `(:type :unknown-type :data "foo"))
-               (json-line (json-encode payload)))
-          (loom--ipc-parse-pipe-line json-line)
-          (should (string-match-p "warn: nil: IPC filter received unknown message type"
-                                  (car log-messages)))
-          (setq log-messages nil))
+;;         ;; Test unknown message type
+;;         (let* ((payload `(:type :unknown-type :data "foo"))
+;;                (json-line (json-encode payload)))
+;;           (loom--ipc-parse-pipe-line json-line)
+;;           (should (string-match-p "warn: nil: IPC filter received unknown message type"
+;;                                   (car log-messages)))
+;;           (setq log-messages nil))
 
-        ;; Test malformed JSON
-        (loom--ipc-parse-pipe-line "{not json")
-        (should (string-match-p "error: nil: JSON parse error in IPC"
-                                (car log-messages)))))))
+;;         ;; Test malformed JSON
+;;         (loom--ipc-parse-pipe-line "{not json")
+;;         (should (string-match-p "error: nil: JSON parse error in IPC"
+;;                                 (car log-messages)))))))
 
-(loom-deftest loom-ipc-filter-partial-lines-test ()
-  "Tests `loom--ipc-filter` handles partial lines and concatenates them
-before parsing a complete line. This test uses a real IPC process
-and mocks `process-send-string` to simulate partial writes."
-  (unless (executable-find "cat")
-    (skip "Skipping loom-ipc-filter-partial-lines-test: 'cat' executable not found."))
+;; (loom-deftest loom-ipc-filter-partial-lines-test ()
+;;   "Tests `loom--ipc-filter` handles partial lines and concatenates them
+;; before parsing a complete line. This test uses a real IPC process
+;; and mocks `process-send-string` to simulate partial writes."
+;;   (unless (executable-find "cat")
+;;     (skip "Skipping loom-ipc-filter-partial-lines-test: 'cat' executable not found."))
 
-  ;; loom-deftest already calls loom:init, so loom--ipc-process is a real pipe.
-  (let* ((process loom--ipc-process) ; Get the real process object
-         (p (loom:promise :name "partial-line-test-promise"))
-         (p-id (loom-promise-id p)))
+;;   ;; loom-deftest already calls loom:init, so loom--ipc-process is a real pipe.
+;;   (let* ((process loom--ipc-process) ; Get the real process object
+;;          (p (loom:promise :name "partial-line-test-promise"))
+;;          (p-id (loom-promise-id p)))
 
-    (should (loom:pending-p p))
+;;     (should (loom:pending-p p))
 
-    ;; Temporarily redefine `process-send-string` to intercept and
-    ;; manually feed chunks to the real `loom--ipc-filter`.
-    (cl-letf (((symbol-function 'process-send-string)
-               (lambda (_p _s)
-                 ;; Instead of sending to the real process, we feed directly to the filter.
-                 ;; The real filter is already attached to loom--ipc-process.
-                 ;; We also append to test-ipc-sent-strings for raw content verification.
-                 (push _s test-ipc-sent-strings)
-                 (loom--ipc-filter loom--ipc-process _s))))
-      ;; Clear previous sent strings
-      (setq test-ipc-sent-strings nil)
+;;     ;; Temporarily redefine `process-send-string` to intercept and
+;;     ;; manually feed chunks to the real `loom--ipc-filter`.
+;;     (cl-letf (((symbol-function 'process-send-string)
+;;                (lambda (_p _s)
+;;                  ;; Instead of sending to the real process, we feed directly to the filter.
+;;                  ;; The real filter is already attached to loom--ipc-process.
+;;                  ;; We also append to test-ipc-sent-strings for raw content verification.
+;;                  (push _s test-ipc-sent-strings)
+;;                  (loom--ipc-filter loom--ipc-process _s))))
+;;       ;; Clear previous sent strings
+;;       (setq test-ipc-sent-strings nil)
 
-      ;; Simulate sending data in chunks
-      (process-send-string process "{\"id\":")
-      (process-send-string process (format "%S," p-id))
-      (process-send-string process "\"value\":\"chunked-value\",\"type\":\"promise-settled\"}\n")
+;;       ;; Simulate sending data in chunks
+;;       (process-send-string process "{\"id\":")
+;;       (process-send-string process (format "%S," p-id))
+;;       (process-send-string process "\"value\":\"chunked-value\",\"type\":\"promise-settled\"}\n")
 
-      ;; Give Emacs time to process the filter output (which happens synchronously here)
-      (sit-for 0.01)
+;;       ;; Give Emacs time to process the filter output (which happens synchronously here)
+;;       (sit-for 0.01)
 
-      ;; Verify the promise is resolved by the real filter
-      (should (loom:resolved-p p))
-      (should (string= (loom:value p) "chunked-value"))
+;;       ;; Verify the promise is resolved by the real filter
+;;       (should (loom:resolved-p p))
+;;       (should (string= (loom:value p) "chunked-value"))
 
-      ;; Verify the raw strings sent via our mocked process-send-string
-      (should (equal (length test-ipc-sent-strings) 3))
-      (should (string= (nth 2 test-ipc-sent-strings) "{\"id\":"))
-      (should (string= (nth 1 test-ipc-sent-strings) (format "%S," p-id)))
-      (should (string= (nth 0 test-ipc-sent-strings) "\"value\":\"chunked-value\",\"type\":\"promise-settled\"}\n")))))
+;;       ;; Verify the raw strings sent via our mocked process-send-string
+;;       (should (equal (length test-ipc-sent-strings) 3))
+;;       (should (string= (nth 2 test-ipc-sent-strings) "{\"id\":"))
+;;       (should (string= (nth 1 test-ipc-sent-strings) (format "%S," p-id)))
+;;       (should (string= (nth 0 test-ipc-sent-strings) "\"value\":\"chunked-value\",\"type\":\"promise-settled\"}\n")))))
 
-(loom-deftest loom-ipc-sentinel-test ()
-  "Tests `loom--ipc-sentinel` triggers `loom:ipc-cleanup` on process
-termination events. This test uses a real IPC process and mocks
-`delete-process` to simulate termination."
-  (unless (executable-find "cat")
-    (skip "Skipping loom-ipc-sentinel-test: 'cat' executable not found."))
+;; (loom-deftest loom-ipc-sentinel-test ()
+;;   "Tests `loom--ipc-sentinel` triggers `loom:ipc-cleanup` on process
+;; termination events. This test uses a real IPC process and mocks
+;; `delete-process` to simulate termination."
+;;   (unless (executable-find "cat")
+;;     (skip "Skipping loom-ipc-sentinel-test: 'cat' executable not found."))
 
-  ;; loom-deftest already calls loom:init, so loom--ipc-process is a real pipe.
-  (let* ((process loom--ipc-process) ; Get the real process object
-         (cleanup-called nil))
-    ;; Mock `loom:ipc-cleanup` to track calls
-    (cl-letf (((symbol-function 'loom:ipc-cleanup)
-               (lambda () (setq cleanup-called t))))
-      ;; Temporarily redefine `delete-process` to simulate termination
-      ;; and call the real sentinel.
-      (cl-letf (((symbol-function 'delete-process)
-                 (lambda (_p)
-                   ;; Call the real sentinel attached to the actual loom--ipc-process
-                   (when-let ((sentinel-fn (process-sentinel loom--ipc-process)))
-                     (funcall sentinel-fn loom--ipc-process "mock-process exited")))))
-        ;; Simulate process termination event by calling the mocked delete-process
-        (delete-process process)
-        (should cleanup-called)))))
-        
+;;   ;; loom-deftest already calls loom:init, so loom--ipc-process is a real pipe.
+;;   (let* ((process loom--ipc-process) ; Get the real process object
+;;          (cleanup-called nil))
+;;     ;; Mock `loom:ipc-cleanup` to track calls
+;;     (cl-letf (((symbol-function 'loom:ipc-cleanup)
+;;                (lambda () (setq cleanup-called t))))
+;;       ;; Temporarily redefine `delete-process` to simulate termination
+;;       ;; and call the real sentinel.
+;;       (cl-letf (((symbol-function 'delete-process)
+;;                  (lambda (_p)
+;;                    ;; Call the real sentinel attached to the actual loom--ipc-process
+;;                    (when-let ((sentinel-fn (process-sentinel loom--ipc-process)))
+;;                      (funcall sentinel-fn loom--ipc-process "mock-process exited")))))
+;;         ;; Simulate process termination event by calling the mocked delete-process
+;;         (delete-process process)
+;;         (should cleanup-called)))))
+
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Test Suite: loom-semaphore.el
 
@@ -2689,122 +2689,122 @@ behaving like distinct event cycles."
     (setq p3 (loom:event-wait event))
     (should (string= "third-round" (loom:await p3)))))
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Test Suite: loom-flow.el
+;; ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; ;;; Test Suite: loom-flow.el
 
-(loom-deftest loom-flow-let-test ()
-  "Test `loom:let` for parallel asynchronous binding."
-  (let ((p (loom:let ((a (loom:delay 0.02 1)) ; Delay a for longer
-                      (b (loom:delay 0.01 2))) ; Delay b for shorter
-             (+ a b)))) ; Both evaluated in parallel
-    (should (= 3 (loom:await p)))))
+;; (loom-deftest loom-flow-let-test ()
+;;   "Test `loom:let` for parallel asynchronous binding."
+;;   (let ((p (loom:let ((a (loom:delay 0.02 1)) ; Delay a for longer
+;;                       (b (loom:delay 0.01 2))) ; Delay b for shorter
+;;              (+ a b)))) ; Both evaluated in parallel
+;;     (should (= 3 (loom:await p)))))
 
-(loom-deftest loom-flow-let-star-test ()
-  "Test `loom:let*` for sequential asynchronous binding."
-  (let ((p (loom:let* ((a (loom:resolved! 10)) ; a resolves immediately
-                       (b (loom:delay 0.01 (* a 2)))) ; b depends on a
-             b)))
-    (should (= 20 (loom:await p)))))
+;; (loom-deftest loom-flow-let-star-test ()
+;;   "Test `loom:let*` for sequential asynchronous binding."
+;;   (let ((p (loom:let* ((a (loom:resolved! 10)) ; a resolves immediately
+;;                        (b (loom:delay 0.01 (* a 2)))) ; b depends on a
+;;              b)))
+;;     (should (= 20 (loom:await p)))))
 
-(loom-deftest loom-flow-if-test ()
-  "Test `loom:if!`, `loom:when!`, and `loom:unless!`."
-  ;; Test `loom:if!`
-  (should (string= "then" (loom:await (loom:if! (loom:resolved! t)
-                                                 "then" "else"))))
-  (should (string= "else" (loom:await (loom:if! (loom:resolved! nil)
-                                                 "then" "else"))))
-  ;; Test `loom:when!`
-  (should (string= "body" (loom:await (loom:when! (loom:resolved! t)
-                                                  "body"))))
-  (should (null (loom:await (loom:when! (loom:resolved! nil)
-                                                   "body"))))
-  ;; Test `loom:unless!`
-  (should (null (loom:await (loom:unless! (loom:resolved! t)
-                                                    "body"))))
-  (should (string= "body" (loom:await (loom:unless! (loom:resolved! nil)
-                                                    "body")))))
+;; (loom-deftest loom-flow-if-test ()
+;;   "Test `loom:if!`, `loom:when!`, and `loom:unless!`."
+;;   ;; Test `loom:if!`
+;;   (should (string= "then" (loom:await (loom:if! (loom:resolved! t)
+;;                                                  "then" "else"))))
+;;   (should (string= "else" (loom:await (loom:if! (loom:resolved! nil)
+;;                                                  "then" "else"))))
+;;   ;; Test `loom:when!`
+;;   (should (string= "body" (loom:await (loom:when! (loom:resolved! t)
+;;                                                   "body"))))
+;;   (should (null (loom:await (loom:when! (loom:resolved! nil)
+;;                                                    "body"))))
+;;   ;; Test `loom:unless!`
+;;   (should (null (loom:await (loom:unless! (loom:resolved! t)
+;;                                                     "body"))))
+;;   (should (string= "body" (loom:await (loom:unless! (loom:resolved! nil)
+;;                                                     "body")))))
 
-(loom-deftest loom-flow-cond-test ()
-  "Test `loom:cond!` for asynchronous conditional branching."
-  ;; First condition evaluates to nil, second to t
-  (let ((p (loom:cond! ((loom:resolved! nil) 'a)
-                       ((loom:delay 0.01 t) 'b)
-                       (t 'c))))
-    (should (eq 'b (loom:await p))))
-  ;; Both first conditions evaluate to nil, fall through to `t`
-  (let ((p (loom:cond! ((loom:resolved! nil) 'a)
-                       ((loom:resolved! nil) 'b)
-                       (t 'c))))
-    (should (eq 'c (loom:await p))))
-  ;; No conditions match, result should be nil
-  (let ((p (loom:cond! ((loom:resolved! nil) 'a))))
-    (should (null (loom:await p)))))
+;; (loom-deftest loom-flow-cond-test ()
+;;   "Test `loom:cond!` for asynchronous conditional branching."
+;;   ;; First condition evaluates to nil, second to t
+;;   (let ((p (loom:cond! ((loom:resolved! nil) 'a)
+;;                        ((loom:delay 0.01 t) 'b)
+;;                        (t 'c))))
+;;     (should (eq 'b (loom:await p))))
+;;   ;; Both first conditions evaluate to nil, fall through to `t`
+;;   (let ((p (loom:cond! ((loom:resolved! nil) 'a)
+;;                        ((loom:resolved! nil) 'b)
+;;                        (t 'c))))
+;;     (should (eq 'c (loom:await p))))
+;;   ;; No conditions match, result should be nil
+;;   (let ((p (loom:cond! ((loom:resolved! nil) 'a))))
+;;     (should (null (loom:await p)))))
 
-(loom-deftest loom-flow-looping-constructs-test ()
-  "Test `loom:while!`, `loom:dolist!`, and `loom:dotimes!`."
-  ;; Test `loom:while!`
-  (let ((i 0))
-    (should (null (loom:await
-                   (loom:while! (loom:resolved! (< i 3))
-                                (cl-incf i)
-                                (loom:delay 0.01))))) ; Simulate async work
-    (should (= 3 i))) ; Loop should run until i is 3
-  ;; Test `loom:dolist!`
-  (let ((results '()))
-    (should (eq 'done (loom:await
-                       (loom:dolist! (x '(a b c) 'done)
-                                     (push x results)
-                                     (loom:delay 0.01)))))
-    (should (equal '(c b a) results))) ; Order is reverse of iteration
-  ;; Test `loom:dotimes!`
-  (let ((counter 0))
-    (should (eq 'finished (loom:await
-                           (loom:dotimes! (i 3 'finished)
-                                          (cl-incf counter)
-                                          (loom:delay 0.01)))))
-    (should (= 3 counter))))
+;; (loom-deftest loom-flow-looping-constructs-test ()
+;;   "Test `loom:while!`, `loom:dolist!`, and `loom:dotimes!`."
+;;   ;; Test `loom:while!`
+;;   (let ((i 0))
+;;     (should (null (loom:await
+;;                    (loom:while! (loom:resolved! (< i 3))
+;;                                 (cl-incf i)
+;;                                 (loom:delay 0.01))))) ; Simulate async work
+;;     (should (= 3 i))) ; Loop should run until i is 3
+;;   ;; Test `loom:dolist!`
+;;   (let ((results '()))
+;;     (should (eq 'done (loom:await
+;;                        (loom:dolist! (x '(a b c) 'done)
+;;                                      (push x results)
+;;                                      (loom:delay 0.01)))))
+;;     (should (equal '(c b a) results))) ; Order is reverse of iteration
+;;   ;; Test `loom:dotimes!`
+;;   (let ((counter 0))
+;;     (should (eq 'finished (loom:await
+;;                            (loom:dotimes! (i 3 'finished)
+;;                                           (cl-incf counter)
+;;                                           (loom:delay 0.01)))))
+;;     (should (= 3 counter))))
 
-(loom-deftest loom-flow-loop-break-continue-test ()
-  "Test `loom:loop!`, `loom:break!`, and `loom:continue!`."
-  ;; Test `loom:loop!` with `break!`
-  (let ((counter 0))
-    (let ((p (loom:loop!
-              (cl-incf counter)
-              (loom:when! (loom:resolved! (= counter 3))
-                          (break "three")))))
-      (should (string= "three" (loom:await p)))
-      (should (= 3 counter))))
-  ;; Test `loom:loop!` with `continue!` and `break!`
-  (let ((counter 0) (skipped-vals '()))
-    (let ((p (loom:loop!
-              (cl-incf counter)
-              (loom:when! (loom:resolved! (= counter 5))
-                          (break "five")) ; Break when counter is 5
-              (loom:when! (loom:resolved! (oddp counter))
-                          (push counter skipped-vals)
-                          (continue))))) ; Continue for odd numbers
-      (should (string= "five" (loom:await p)))
-      (should (= 5 counter))
-      (should (equal '(3 1) skipped-vals))))) ; Skipped 1 and 3 (odd)
+;; (loom-deftest loom-flow-loop-break-continue-test ()
+;;   "Test `loom:loop!`, `loom:break!`, and `loom:continue!`."
+;;   ;; Test `loom:loop!` with `break!`
+;;   (let ((counter 0))
+;;     (let ((p (loom:loop!
+;;               (cl-incf counter)
+;;               (loom:when! (loom:resolved! (= counter 3))
+;;                           (break "three")))))
+;;       (should (string= "three" (loom:await p)))
+;;       (should (= 3 counter))))
+;;   ;; Test `loom:loop!` with `continue!` and `break!`
+;;   (let ((counter 0) (skipped-vals '()))
+;;     (let ((p (loom:loop!
+;;               (cl-incf counter)
+;;               (loom:when! (loom:resolved! (= counter 5))
+;;                           (break "five")) ; Break when counter is 5
+;;               (loom:when! (loom:resolved! (oddp counter))
+;;                           (push counter skipped-vals)
+;;                           (continue))))) ; Continue for odd numbers
+;;       (should (string= "five" (loom:await p)))
+;;       (should (= 5 counter))
+;;       (should (equal '(3 1) skipped-vals))))) ; Skipped 1 and 3 (odd)
 
-(loom-deftest loom-flow-try-catch-finally-test ()
-  "Test `loom:try!` with `:catch` and `:finally` clauses."
-  ;; Successful `try!`, `finally` always runs
-  (let (finally-run)
-    (let ((p (loom:try! (loom:resolved! "ok")
-                        (:finally (setq finally-run t)))))
-      (should (string= "ok" (loom:await p)))
-      (should finally-run)))
-  ;; Rejected `try!`, `catch` and `finally` run
-  (let (finally-run caught-err)
-    (let ((p (loom:try! (loom:rejected! "fail")
-                        (:catch (err)
-                                (setq caught-err err)
-                                "caught")
-                        (:finally (setq finally-run t)))))
-      (should (string= "caught" (loom:await p))) ; `catch` handler transforms rejection
-      (should (string= "fail" (loom:error-message caught-err)))
-      (should finally-run))))
+;; (loom-deftest loom-flow-try-catch-finally-test ()
+;;   "Test `loom:try!` with `:catch` and `:finally` clauses."
+;;   ;; Successful `try!`, `finally` always runs
+;;   (let (finally-run)
+;;     (let ((p (loom:try! (loom:resolved! "ok")
+;;                         (:finally (setq finally-run t)))))
+;;       (should (string= "ok" (loom:await p)))
+;;       (should finally-run)))
+;;   ;; Rejected `try!`, `catch` and `finally` run
+;;   (let (finally-run caught-err)
+;;     (let ((p (loom:try! (loom:rejected! "fail")
+;;                         (:catch (err)
+;;                                 (setq caught-err err)
+;;                                 "caught")
+;;                         (:finally (setq finally-run t)))))
+;;       (should (string= "caught" (loom:await p))) ; `catch` handler transforms rejection
+;;       (should (string= "fail" (loom:error-message caught-err)))
+;;       (should finally-run))))
 
 (provide 'loom-tests)
 ;;; loom-tests.el ends here

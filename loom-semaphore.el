@@ -389,6 +389,43 @@ Signals:
     nil))
 
 ;;;###autoload
+(defmacro loom:with-semaphore! (sem-obj &rest body)
+  "Execute `BODY` after acquiring a single permit from `SEM-OBJ`.
+This macro ensures the permit is always released.
+
+Arguments:
+- `SEM-OBJ` (loom-semaphore): The semaphore to acquire a permit from.
+- `BODY` (forms): The Lisp forms to execute.
+
+Returns:
+- (loom-promise): A promise that resolves with the result of `BODY`."
+  (declare (indent 1) (debug t))
+  `(loom:then (loom:semaphore-acquire ,sem-obj)
+              (lambda (_)
+                (loom:finally (progn ,@body)
+                              (lambda () (loom:semaphore-release ,sem-obj))))))
+
+;;;###autoload
+(defmacro loom:semaphore-with-permits! (sem-obj permits &rest body)
+  "Execute `BODY` after acquiring `PERMITS` slots from `SEM-OBJ`.
+This macro ensures the permits are always released.
+
+Arguments:
+- `SEM-OBJ` (loom-semaphore): The semaphore to acquire from.
+- `PERMITS` (integer): Number of permits to acquire.
+- `BODY` (forms): The Lisp forms to execute.
+
+Returns:
+- (loom-promise): A promise that resolves with the result of `BODY`."
+  (declare (indent 1) (debug t))
+  `(loom:then (loom:semaphore-acquire ,sem-obj :permits ,permits)
+              (lambda (acquired-permits)
+                (loom:finally (progn ,@body)
+                              (lambda ()
+                                (loom:semaphore-release
+                                 ,sem-obj acquired-permits))))))
+
+;;;###autoload
 (defun loom:semaphore-drain (sem)
   "Acquire all available permits from `SEM` immediately.
 

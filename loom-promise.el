@@ -14,16 +14,17 @@
 ;;
 ;; - **Promise/A+ Compliance:** Implements a strict state machine (`:pending`,
 ;;   `:resolved`, `:rejected`) where a promise can only be settled once. It
-;;   guarante всех that all callbacks (`.then`, `.catch`, `.finally`) execute
+;;   guarantees that all callbacks (`.then`, `.catch`, `.finally`) execute
 ;;   asynchronously, preventing stack overflow and ensuring a consistent
 ;;   execution order.
 ;;
 ;; - **Centralized State Management:** To eliminate race conditions, all state
 ;;   transitions (settling a promise) for `:thread` and `:process` mode promises
 ;;   are funneled through the main Emacs thread via the IPC mechanism. A
-;;   background thread's attempt to settle a promise dispatches a message to the
-;;   main thread, which then performs the actual state change. This makes the
-;;   main thread the single source of truth for a promise's lifecycle.
+;;   background thread or process's attempt to settle a promise dispatches a
+;;   message to the main thread, which then performs the actual state change.
+;;   This makes the main thread the single source of truth for a promise's
+;;   lifecycle.
 ;;
 ;; - **Cooperative `await`:** The `loom:await` macro provides a way to write
 ;;   synchronous-looking code that consumes promises. Critically, it does **not**
@@ -34,8 +35,8 @@
 ;; - **Flexible Concurrency Modes:** Supports promises that encapsulate work
 ;;   in different contexts:
 ;;   - `:deferred`: For operations on the main Emacs thread's event loop.
-;;   - `:thread`: For tasks offloaded to a native Emacs Lisp thread.
-;;   - `:process`: For tasks managed in an external OS process.
+;;   - `:thread`: For tasks offloaded to a shared thread pool.
+;;   - `:process`: For tasks offloaded to a shared background process pool.
 ;;
 ;; - **Cancellation:** Integrates with `loom-cancel-token` to allow for the
 ;;   propagation of cancellation requests through a chain of promises.
@@ -57,6 +58,8 @@
 (require 'loom-errors)
 (require 'loom-callback)
 (require 'loom-poll)
+(require 'loom-thread-pool)
+(require 'loom-multiprocess)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Forward Declarations
@@ -178,6 +181,40 @@ Fields:
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Internal Core Promise Lifecycle
+
+(defun loom--promise-execute-executor (promise executor)
+  "Internal helper to safely run a promise's executor function.
+It wraps the execution in a `condition-case` so that if the executor
+function itself throws a synchronous error, the newly created promise is
+immediately rejected with that error.
+
+Arguments:
+- `PROMISE` (loom-promise): The new promise being constructed.
+- `EXECUTOR` (function): The user-provided executor `(lambda (resolve reject) ...)`
+
+Returns: `nil`.
+
+Spec References:
+- [Promise/A+ 2.1]: The `executor` is passed `resolve` and `reject` functions.
+- [Promise/A+ 2.1.1.4]: `executor` may throw an error."
+  (let ((id (loom-promise-id promise)))
+    (loom-log :debug id "Executing promise executor function.")
+    (cl-letf (((symbol-value 'loom-current-async-stack)
+               (cons (format "Executor (%S)" id) loom-current-async-stack)))
+      (condition-case err
+          ;; Call the executor with the resolve/reject functions bound to this
+          ;; promise.
+          (funcall executor
+                   (lambda (v) (loom:resolve promise v))
+                   (lambda (e) (loom:reject promise e)))
+        ;; If the executor itself throws an error...
+        (error
+         (let ((msg (format "Promise executor function failed synchronously: %s"
+                            (error-message-string err))))
+           (loom-log :error id "%s" msg)
+           ;; ...reject the promise with that error.
+           (loom:reject promise (loom:make-error :type :executor-error
+                                                 :message msg :cause err))))))))
 
 (defun loom--trigger-callbacks-after-settle (promise callback-links)
   "Schedules a promise's callbacks for execution after it has settled.
@@ -468,7 +505,7 @@ Signals: `loom-timeout-error` or `loom-await-error` on failure."
       ;; to cancel the timer to prevent it from firing after we're done.
       (when timer (cancel-timer timer)))))
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Public API (Package Private): Attaching/Executing Callbacks
 
 (defun loom--execute-simple-callback (callback)
@@ -619,16 +656,23 @@ Spec References:
 (cl-defun loom:promise (&key executor (mode :deferred) name
                              parent-promise cancel-token tags)
   "Creates a new, pending `loom-promise`. This is the primary constructor.
-If an `:executor` function `(lambda (resolve reject) ...)` is provided,
-its execution is handled based on the promise `:mode`.
+If an `:executor` is provided, its execution is handled based on the `:mode`.
 
 - `:deferred`: The executor runs immediately on the current thread.
-- `:thread`: The executor is run in a new background thread.
-- `:process`: (Not implemented in this function, requires a different setup).
+- `:thread`: The executor is run in the shared, default thread pool.
+- `:process`: The executor is treated as a Lisp FORM and run in the
+  shared, default multiprocess pool. Because functions cannot be
+  sent to another process, the `resolve` and `reject` arguments
+  are not available in this mode; the form's return value is used
+  to resolve the promise.
 
 Arguments:
-- `:EXECUTOR` (function, optional): The function that starts the async work.
-- `:MODE` (symbol): Concurrency mode: `:deferred` or `:thread`.
+- `:EXECUTOR` (function or form, optional): The async work to perform.
+  - For `:deferred` and `:thread` modes, this must be a function of the
+    form `(lambda (resolve reject) ...)`.
+  - For `:process` mode, this must be a serializable Lisp form to be
+    evaluated in a worker process.
+- `:MODE` (symbol): Concurrency mode: `:deferred`, `:thread`, or `:process`.
 - `:NAME` (string, optional): A descriptive name for debugging and logging.
 - `:PARENT-PROMISE` (loom-promise, internal): Used by `.then` to link promises.
 - `:CANCEL-TOKEN` (loom-cancel-token, optional): A token for propagating
@@ -649,8 +693,6 @@ Returns: A new `loom-promise` in the `:pending` state."
                                     :parent-promise parent-promise
                                     :tags tags)
 
-    ;; If a cancellation token is provided, register a callback to cancel this
-    ;; promise if the token is triggered.
     (when cancel-token
       (loom-cancel-token-add-callback
        cancel-token (lambda (reason) (loom:cancel promise reason))))
@@ -658,14 +700,23 @@ Returns: A new `loom-promise` in the `:pending` state."
     (when executor
       (pcase mode
         (:deferred
-         ;; For deferred mode, execute immediately on the current thread.
          (loom--promise-execute-executor promise executor))
         (:thread
          (unless (fboundp 'make-thread)
            (error "Emacs does not support threads; cannot use :thread mode"))
-         ;; For thread mode, run the executor helper in a new thread.
-         (make-thread (lambda () (loom--promise-execute-executor promise executor))
-                      (format "loom-promise-%S" promise-id)))
+         (loom:thread-pool-submit (loom:thread-pool-default)
+                                  #'loom--promise-execute-executor
+                                  promise
+                                  executor))
+        (:process
+         ;; For process mode, we submit the EXECUTOR form to the multiprocess
+         ;; pool. The returned promise from the pool is then used to settle
+         ;; the promise we just created.
+         (let ((pool-promise (loom:multiprocess! executor)))
+           ;; Link the settlement of the outer promise to the inner pool promise.
+           (loom:then pool-promise
+                      (lambda (result) (loom:resolve promise result))
+                      (lambda (err) (loom:reject promise err)))))
         (_
          (error "Unsupported promise mode for executor: %S" mode))))
     promise))

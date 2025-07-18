@@ -179,63 +179,95 @@ Signals:
 
   (loom-log :info nil "Initializing pipe '%s' in :%s mode." path mode)
 
-  (let* ((pipe-process nil)
-         (pipe-buffer (and (eq mode :read)
-                           (or buffer
-                               (generate-new-buffer
-                                (format " *loom-pipe-reader: %s*"
-                                        (file-name-nondirectory path))))))
-         (cat-command (loom--pipe-get-cat-command)))
-
-    (condition-case err
+  ;; Use `unwind-protect` to guarantee cleanup of partial resources if an error
+  ;; occurs anywhere during the initialization process.
+  (let (pipe-process pipe-buffer successful-p)
+    (unwind-protect
+        ;; Main body: Attempt to create all resources.
         (progn
-          (pcase mode
-            (:read
-             ;; The reader is responsible for creating the FIFO if it doesn't exist.
-             (unless (file-exists-p path)
-               (loom--pipe-create-fifo path))
-             (setq pipe-process
-                   (apply #'start-process
-                          (format "loom-pipe-reader-%s" (file-name-nondirectory path))
-                          pipe-buffer
-                          (car cat-command)
-                          (append (cdr cat-command) (list path)))))
-            (:write
-             ;; The writer connects to the FIFO, assuming the reader created it.
-             ;; The `sh -c 'cmd > fifo'` pattern is a standard way to open a
-             ;; pipe for writing without the shell command itself closing it.
-             (let ((sh-command (format "%s > %s"
-                                       (string-join cat-command " ")
-                                       (shell-quote-argument path))))
-               (setq pipe-process
-                     (start-process
-                      (format "loom-pipe-writer-%s" (file-name-nondirectory path))
-                      nil "sh" "-c" sh-command)))))
+          (setq pipe-buffer
+                (and (eq mode :read)
+                     (or buffer
+                         (generate-new-buffer
+                          (format " *loom-pipe-reader: %s*"
+                                  (file-name-nondirectory path))))))
+          (let ((cat-command (loom--pipe-get-cat-command)))
+            (condition-case err
+                (progn
+                  (pcase mode
+                    (:read
+                     ;; The reader creates the FIFO if it doesn't exist.
+                     (unless (file-exists-p path)
+                       (loom--pipe-create-fifo path))
+                     (setq pipe-process
+                           (apply #'start-process
+                                  (format "loom-pipe-reader-%s"
+                                          (file-name-nondirectory path))
+                                  pipe-buffer
+                                  (car cat-command)
+                                  (append (cdr cat-command) (list path)))))
+                    (:write
+                     ;; FIX: Check that the FIFO exists and is the correct
+                     ;; file type to prevent a race condition.
+                     (unless (file-exists-p path)
+                       (error (concat "Pipe writer for '%s' cannot start: "
+                                      "FIFO does not exist.") path))
+                     (unless (eq 'fifo (nth 2 (file-attributes path)))
+                       (error "Pipe writer for '%s' cannot start: a file exists but is not a FIFO."
+                              path))
+                     ;; The `sh -c 'cmd > fifo'` pattern opens a pipe for
+                     ;; writing without the shell command itself closing it.
+                     (let ((sh-command
+                            (format "%s > %s"
+                                    (string-join cat-command " ")
+                                    (shell-quote-argument path))))
+                       (setq pipe-process
+                             (start-process
+                              (format "loom-pipe-writer-%s"
+                                      (file-name-nondirectory path))
+                              nil "sh" "-c" sh-command)))))
 
-          ;; After attempting to start, verify the process is actually live.
-          (unless (process-live-p pipe-process)
-            (error "Failed to start underlying process.")))
-      (error
-       (loom-log :error nil "Failed to initialize pipe '%s': %S" path err)
-       (signal 'loom-pipe-process-error
-               `(:message ,(format "Pipe initialization failed for %s" path)
-                 :cause ,err))))
+                  ;; After starting, verify the process is live.
+                  (unless (process-live-p pipe-process)
+                    (error "Failed to start underlying process.")))
+              (error
+               (loom-log :error nil "Failed to initialize pipe '%s': %S"
+                         path err)
+               (signal 'loom-pipe-process-error
+                       `(:message ,(format "Pipe init failed for %s" path)
+                         :cause ,err)))))
 
-    ;; Attach filter and sentinel after the process is confirmed to be live.
-    (when filter (set-process-filter pipe-process filter))
-    (when sentinel (set-process-sentinel pipe-process sentinel))
+          ;; Attach filter and sentinel after process is live.
+          (when filter (set-process-filter pipe-process filter))
+          (when sentinel (set-process-sentinel pipe-process sentinel))
 
-    (loom-log :info nil "Pipe '%s' initialized successfully." path)
-    (let ((new-pipe (%%make-loom-pipe :path path
-                                      :mode mode
-                                      :process pipe-process
-                                      :buffer pipe-buffer
-                                      :filter filter
-                                      :sentinel sentinel)))
-      ;; Track the new pipe for automatic cleanup on Emacs exit.
-      (push new-pipe loom--all-pipes)
-      new-pipe)))
+          (loom-log :info nil "Pipe '%s' initialized successfully." path)
+          (let ((new-pipe (%%make-loom-pipe :path path
+                                            :mode mode
+                                            :process pipe-process
+                                            :buffer pipe-buffer
+                                            :filter filter
+                                            :sentinel sentinel)))
+            ;; Track the new pipe for automatic cleanup.
+            (push new-pipe loom--all-pipes)
+            ;; Mark as successful ONLY at the very end.
+            (setq successful-p t)
+            new-pipe))
 
+      ;; Cleanup form: Runs if an error occurred above.
+      (unless successful-p
+        (loom-log :warn nil
+                  (concat "Init of pipe '%s' failed. "
+                          "Cleaning up partial resources.")
+                  path)
+        (when (and pipe-process (process-live-p pipe-process))
+          (delete-process pipe-process))
+        ;; The reader creates the file, so only it should clean it up.
+        (when (and (eq mode :read) (file-exists-p path))
+          (ignore-errors (delete-file path)))
+        (when (and pipe-buffer (buffer-live-p buffer))
+          (kill-buffer buffer))))))
+          
 ;;;###autoload
 (defun loom:pipe-send (pipe string)
   "Send a STRING to a `loom-pipe` configured for writing.
