@@ -18,7 +18,8 @@
 ;;; Internal State
 
 (defvar loom--callback-sequence-counter 0
-  "A global counter for assigning unique sequence IDs to callbacks for FIFO tie-breaking.")
+  "A global counter for assigning unique sequence IDs to callbacks for FIFO
+tie-breaking.")
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Struct Definition
@@ -61,7 +62,8 @@ in schedulers, ensuring consistent behavior.
 
 Arguments:
 - `HANDLER-FN` (function): The actual Emacs Lisp function or closure to
-  execute when the callback is triggered. This is now the first explicit argument.
+  execute when the callback is triggered. This is now the first explicit
+  argument.
 - `:TYPE` (symbol): The callback's purpose or trigger (e.g., `:resolved`,
   `:rejected`, `:await-latch`, `:deferred`).
 - `:PRIORITY` (integer, optional): A scheduling priority, where lower values
@@ -88,7 +90,8 @@ Examples:
                  :source-promise-id 'source-promise
                  :custom-field 'custom-value)
 
-  ;; Combining base data with additional pairs (additional pairs take precedence)
+  ;; Combining base data with additional pairs (additional pairs take 
+  precedence)
   (loom:callback #'my-handler :type :resolved
                  :data '(:foo 1 :bar 2)
                  :bar 3  ; This will override :bar 2 from data
@@ -104,6 +107,25 @@ Examples:
      :handler-fn handler-fn
      :priority priority
      :data final-data)))
+
+(cl-defun loom:ensure-callback (task &key (type :deferred) (priority 50) data)
+  "Ensures `TASK` is a `loom-callback` struct, creating one if not.
+This utility function normalizes tasks submitted to schedulers, allowing
+users to submit raw functions while the schedulers work with a consistent
+`loom-callback` struct internally.
+
+Arguments:
+- `TASK` (function or loom-callback): The task to convert or validate.
+- `:TYPE` (symbol): The callback type to assign if a new struct is created.
+- `:PRIORITY` (integer): The priority to assign if a new struct is created.
+- `:DATA` (plist): The data to associate if a new struct is created.
+
+Returns: A valid `loom-callback` struct."
+  (cond
+   ((loom-callback-p task) task)
+   ((functionp task)
+    (loom:callback task :type type :priority priority :data data))
+   (t (signal 'wrong-type-argument `(or functionp loom-callback-p ,task)))))
 
 (provide 'loom-callback)
 ;;; loom-callback.el ends here

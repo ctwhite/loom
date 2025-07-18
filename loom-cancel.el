@@ -1,17 +1,46 @@
 ;;; loom-cancel.el --- Primitives for Cooperative Cancellation -*- lexical-binding: t; -*-
-;;
+
 ;;; Commentary:
 ;;
-;; This library provides primitives for cooperative cancellation of
-;; asynchronous tasks. `loom-cancel-token` is a thread-safe object used
-;; to signal cancellation. It is now integrated with the core `loom-callback`
-;; and scheduler system.
+;; This library provides the core primitives for **cooperative cancellation**
+;; of asynchronous tasks within the Loom framework. The central concept is
+;; the `loom-cancel-token`, a thread-safe object that represents a cancellation
+;; signal that can be passed among different functions and threads.
+;;
+;; ## Key Concepts
+;;
+;; - **Cooperative Cancellation:** Cancellation is not preemptive. An
+;;   asynchronous task must be explicitly designed to "cooperate" by
+;;   periodically checking a cancellation token (e.g., via
+;;   `loom:throw-if-cancelled`) and aborting its work if signaled.
+;;
+;; - **Cancellation Propagation:** A `loom-cancel-token` can have callbacks
+;;   registered on it. When the token is signaled (via
+;;   `loom:cancel-token-signal`), all registered callbacks are executed
+;;   asynchronously on the microtask queue. This allows cancellation signals
+;;   to be propagated to promises, child tasks, or other parts of the system.
+;;
+;; - **Thread-Safety:** All operations that modify a token's state are
+;;   thread-safe, using an internal mutex to prevent race conditions.
+;;
+;; ## Basic Usage
+;;
+;; 1. Create a token source:
+;;    (let ((token (loom:cancel-token "my-task-token")))
+;;      ...)
+;;
+;; 2. Pass the token to an async function, which registers a callback:
+;;    (my-async-op-with-token promise token)
+;;
+;; 3. When you want to cancel, signal the token:
+;;    (loom:cancel-token-signal token "User requested cancellation.")
 
 ;;; Code:
 
 (require 'cl-lib)
 
 (require 'loom-log)
+(require 'loom-errors)
 (require 'loom-callback)
 (require 'loom-lock)
 (require 'loom-microtask)
@@ -19,14 +48,21 @@
 (require 'loom-primitives)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Forward Declarations
+
+(declare-function loom:microtask "loom-config")
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Error Definitions
 
 (define-error 'loom-cancel-error
-  "A promise or task was cancelled."
+  "An error signaled when a task is aborted due to cancellation.
+This is the error that is typically thrown by `loom:throw-if-cancelled`."
   'loom-error)
 
 (define-error 'loom-cancel-invalid-token-error
-  "An operation was attempted on an invalid cancel token."
+  "An error signaled when an operation is attempted on an object that is
+not a valid `loom-cancel-token`."
   'loom-type-error)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -34,14 +70,20 @@
 
 (cl-defstruct (loom-cancel-token (:constructor %%make-cancel-token))
   "A thread-safe token for signaling cancellation to asynchronous operations.
+This object acts as a shared signal. It can be passed to multiple tasks,
+and when it is cancelled, all listening tasks are notified.
 
 Fields:
-- `cancelled-p` (boolean): `t` if the token has been cancelled.
-- `cancel-reason` (loom-error or nil): The error object representing why.
-- `name` (string): An optional, human-readable name for debugging.
-- `registrations` (list): A list of `loom-callback` structs.
-- `lock` (loom-lock): A mutex for ensuring thread-safe operations.
-- `data` (any): Optional, arbitrary user data."
+- `cancelled-p` (boolean): `t` if the token has been cancelled. This is the
+  primary state flag.
+- `cancel-reason` (loom-error or nil): The structured error object
+  representing why cancellation occurred.
+- `name` (string): An optional, human-readable name for debugging and logging.
+- `registrations` (list): A list of `loom-callback` structs to be invoked
+  upon cancellation.
+- `lock` (loom-lock): A mutex that ensures atomic, thread-safe updates to
+  the token's state.
+- `data` (any): Optional, arbitrary user data for application-specific needs."
   (cancelled-p nil :type boolean)
   (cancel-reason nil :type (or null loom-error))
   (name "" :type string)
@@ -53,10 +95,19 @@ Fields:
 ;;; Internal Helpers
 
 (defun loom--validate-token (token func-name)
-  "Signal a `loom-cancel-invalid-token-error` if TOKEN is invalid."
+  "Signals a `loom-cancel-invalid-token-error` if `TOKEN` is not a
+`loom-cancel-token`.
+
+Arguments:
+- `TOKEN` (any): The object to validate.
+- `FUNC-NAME` (symbol): The name of the calling function for error reporting.
+
+Returns: `nil`.
+Signals: `loom-cancel-invalid-token-error` if `TOKEN` is invalid."
   (unless (loom-cancel-token-p token)
     (signal 'loom-cancel-invalid-token-error
-            (list (format "%s: Invalid token object %S" func-name token)
+            (list (format "%s: Expected a loom-cancel-token, but got %S"
+                          func-name token)
                   token))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -64,248 +115,241 @@ Fields:
 
 ;;;###autoload
 (defun loom:cancel-token (&optional name data)
-  "Create and return a new, non-cancelled cancel token.
+  "Creates and returns a new, non-cancelled cancellation token.
 
 Arguments:
-- `NAME` (string, optional): A human-readable name for debugging.
+- `NAME` (string, optional): A human-readable name for debugging and logging.
 - `DATA` (any, optional): Arbitrary user data to attach to the token.
 
 Returns:
-- (loom-cancel-token): A new token.
-
-Side Effects:
-- Creates a new `loom-cancel-token` struct.
-- Logs a debug message using `loom-log`."
-  (let* ((token-name (or name ""))
+- (loom-cancel-token): A new token instance in the active state."
+  (let* ((token-name (or name "unnamed-token"))
          (token (%%make-cancel-token
                  :name token-name
                  :data data
                  :lock (loom:lock (format "cancel-lock-%s" token-name)))))
-    (loom-log :debug nil "Created cancel token %S" (loom-cancel-token-name token))
+    (loom-log :debug nil "Created cancel token '%s'" token-name)
     token))
 
 ;;;###autoload
 (defun loom:cancel-token-cancelled-p (token)
-  "Check if TOKEN has been cancelled. Thread-safe.
+  "Checks if `TOKEN` has been cancelled. This function is thread-safe.
+
+This provides a fast, non-locking check of the token's status. It is safe
+because the `cancelled-p` field is only ever written once (from `nil` to
+`t`), which is an atomic operation on most platforms. Reading a
+momentarily stale value is an acceptable trade-off for performance in a
+status check.
 
 Arguments:
 - `TOKEN` (loom-cancel-token): The token to check.
 
-Returns:
-- (boolean): `t` if cancelled, `nil` otherwise.
-
-Signals:
-- `loom-cancel-invalid-token-error`: If `TOKEN` is not a valid
-  `loom-cancel-token` object."
+Returns: `t` if cancelled, `nil` otherwise.
+Signals: `loom-cancel-invalid-token-error` if `TOKEN` is invalid."
   (loom--validate-token token 'loom:cancel-token-cancelled-p)
-  (loom:with-mutex! (loom-cancel-token-lock token)
-    (loom-cancel-token-cancelled-p token)))
+  (loom-cancel-token-cancelled-p token))
 
 ;;;###autoload
 (defun loom:cancel-token-reason (token)
-  "Return the cancellation reason if TOKEN is cancelled.
+  "Returns the cancellation reason if `TOKEN` is cancelled. Thread-safe.
 
 Arguments:
 - `TOKEN` (loom-cancel-token): The token to query.
 
 Returns:
-- (loom-error or nil): The error object used for cancellation, or `nil`."
+- (loom-error or nil): The `loom-error` struct provided at cancellation, or `nil`.
+
+Signals: `loom-cancel-invalid-token-error` if `TOKEN` is invalid."
   (loom--validate-token token 'loom:cancel-token-reason)
+  ;; This requires a lock to ensure we read the reason that was set
+  ;; atomically with the `cancelled-p` flag.
   (loom:with-mutex! (loom-cancel-token-lock token)
     (loom-cancel-token-cancel-reason token)))
 
 ;;;###autoload
 (defun loom:throw-if-cancelled (token)
-  "Check TOKEN and signal `loom-cancel-error` if it is cancelled.
-This function serves as a cooperative cancellation point for long-running
-tasks. Tasks are expected to call this periodically to check for
-cancellation and abort their operation if the token is signaled.
+  "Checks `TOKEN` and signals a `loom-cancel-error` if it has been cancelled.
+
+This function is the primary mechanism for implementing **cooperative
+cancellation points**. Long-running synchronous loops or functions should
+call this periodically to check if they have been requested to stop, allowing
+them to abort gracefully.
 
 Arguments:
 - `TOKEN` (loom-cancel-token): The token to check.
 
+Returns: `nil` if the token is not cancelled.
 Signals:
-- `loom-cancel-invalid-token-error`: If `TOKEN` is not a valid
-  `loom-cancel-token` object.
-- `loom-cancel-error`: If the token is cancelled. The original `loom-error`
-  object is passed directly as the error data."
+- `loom-cancel-invalid-token-error`: If `TOKEN` is invalid.
+- `loom-cancel-error`: If the token is cancelled."
   (loom--validate-token token 'loom:throw-if-cancelled)
-  (when-let ((reason (loom:cancel-token-reason token)))
-    (signal 'loom-cancel-error reason)))
-    
+  (when (loom:cancel-token-cancelled-p token)
+    (loom-log :debug nil
+              "Cancellation detected for token '%s'; throwing error."
+              (loom-cancel-token-name token))
+    (signal 'loom-cancel-error (list (loom:cancel-token-reason token)))))
+
 ;;;###autoload
 (defun loom:cancel-token-signal (token &optional reason)
-  "Signal TOKEN as cancelled and invoke registered callbacks asynchronously.
+  "Signals `TOKEN` as cancelled and invokes all registered callbacks
+asynchronously.
+
 This function is idempotent; it does nothing if the token is already
-cancelled. All registered callbacks will be executed via the microtask
-scheduler.
+cancelled. All registered callbacks are scheduled for execution on the
+global microtask queue, ensuring they run promptly but on a clean stack.
 
 Arguments:
 - `TOKEN` (loom-cancel-token): The token to signal.
 - `REASON` (loom-error or string, optional): The reason for cancellation.
-  If a string is provided, it is wrapped in a `loom-cancel-error`.
+  If a string is provided, it's wrapped in a standard `loom-error`.
 
-Returns:
-- (boolean): `t` if the token was signalled for the first time, `nil`
-  otherwise.
-
-Signals:
-- `loom-cancel-invalid-token-error`: If `TOKEN` is not a valid
-  `loom-cancel-token` object.
-
-Side Effects:
-- Changes the `cancelled-p` field of `TOKEN` to `t`.
-- Sets the `cancel-reason` field of `TOKEN`.
-- Clears the `registrations` list of `TOKEN`.
-- Logs an info message using `loom-log`.
-- Schedules and executes all registered cancellation callbacks
-  asynchronously."
+Returns: `t` if the token was cancelled by this call, `nil` if it was already
+cancelled.
+Signals: `loom-cancel-invalid-token-error` if `TOKEN` is invalid."
   (loom--validate-token token 'loom:cancel-token-signal)
-  (let* ((final-reason-string (cond ((stringp reason) reason)
-                                    ((loom-error-p reason) (loom:error-message reason))
-                                    (t "Token cancelled")))
-         (cancellation-error
-          (loom:make-error :type :cancel :message final-reason-string))
-         (was-active nil)
-         (registrations-to-run nil))
-    ;; 1. Atomically update the token's state and grab the callbacks.
+  (let ((cancellation-error (if (loom-error-p reason) reason
+                              (loom:make-error :type :cancel
+                                               :message (or reason "Token was cancelled."))))
+        was-active
+        registrations-to-run)
+    ;; Step 1: Atomically update the token's state and retrieve the callbacks.
+    ;; This is done under a lock to prevent race conditions.
     (loom:with-mutex! (loom-cancel-token-lock token)
       (unless (loom-cancel-token-cancelled-p token)
         (setq was-active t)
         (setf (loom-cancel-token-cancelled-p token) t
               (loom-cancel-token-cancel-reason token) cancellation-error)
+        ;; Grab the list of callbacks and clear it on the token, so they
+        ;; are only ever executed once.
         (setq registrations-to-run (loom-cancel-token-registrations token))
         (setf (loom-cancel-token-registrations token) '())))
 
-    ;; 2. If the state changed, run callbacks outside the lock.
+    ;; Step 2: If the state was changed, execute callbacks *outside* the lock.
+    ;; This prevents deadlocks if a callback tries to acquire another lock.
     (when was-active
-      (loom-log :info nil "Signaled token %S (Reason: %S)"
+      (loom-log :info nil
+                "Signaling token '%s' (Reason: %s). Scheduling %d callbacks."
                 (loom-cancel-token-name token)
-                (loom:error-message cancellation-error))
-      (let ((tasks-to-run
-             (mapcar
-              (lambda (registered-cb)
-                (let ((handler (loom-callback-handler-fn registered-cb)))
-                  (loom:callback
-                   (lambda () 
-                     (condition-case err
-                         (funcall handler cancellation-error)
-                       (error
-                        (loom-log :error nil
-                                  "Cancellation callback failed for token %S: %S"
-                                  (loom-cancel-token-name token) err))))
-                   :type :deferred
-                   :priority 0))) 
-              registrations-to-run)))
-        (when tasks-to-run
-          (loom:schedule-microtasks loom--microtask-scheduler tasks-to-run))))
+                (loom:error-message cancellation-error)
+                (length registrations-to-run))
+      ;; Schedule each registered callback to run on the microtask queue.
+      (dolist (registered-cb registrations-to-run)
+        (loom:microtask
+         (loom:callback
+          (lambda ()
+            (condition-case err
+                (funcall (loom-callback-handler-fn registered-cb)
+                         cancellation-error)
+              (error
+               (loom-log :error nil "Cancel callback failed for token '%s': %S"
+                         (loom-cancel-token-name token) err))))))))
     was-active))
 
 ;;;###autoload
-(cl-defun loom:cancel-token-add-callback (token callback)
-  "Register a CALLBACK function to run when TOKEN is cancelled.
-The CALLBACK will receive one argument: the `loom-error` reason. If the
-token is already cancelled, the callback is scheduled for execution
-immediately via the global microtask queue.
+(defun loom:cancel-token-add-callback (token callback)
+  "Registers a `CALLBACK` function to run when `TOKEN` is cancelled.
+
+The `CALLBACK` will be a function of one argument, `(lambda (reason))`,
+where `reason` is the `loom-error` object. If the token is already
+cancelled when this is called, the callback is scheduled for execution
+immediately on the global microtask queue.
 
 Arguments:
 - `TOKEN` (loom-cancel-token): The token to monitor.
-- `CALLBACK` (function): A function of one argument, `(lambda (reason))`.
+- `CALLBACK` (function): The function to invoke upon cancellation.
 
-Returns:
-- `nil`.
-
-Signals:
-- `loom-cancel-invalid-token-error`: If `TOKEN` is not a valid
-  `loom-cancel-token` object.
-- `error`: If `CALLBACK` is not a function.
-
-Side Effects:
-- Adds a new registration to the `registrations` list of `TOKEN` if the
-  token is not yet cancelled and the callback is not already registered.
-- If the token is already cancelled, the `CALLBACK` is immediately
-  scheduled for execution."
+Returns: `nil`.
+Signals: `loom-cancel-invalid-token-error` or `error` for invalid arguments."
   (loom--validate-token token 'loom:cancel-token-add-callback)
-  (unless (functionp callback) (error "CALLBACK must be a function: %S" callback))
+  (unless (functionp callback)
+    (error "CALLBACK argument must be a function, but got %S" callback))
 
-  (if-let ((reason (loom:cancel-token-reason token)))
-      (loom:schedule-microtasks
-       loom--microtask-scheduler
-       (list (loom:callback 
-               (lambda () (funcall callback reason)) 
-               :type :deferred 
-               :priority 0))) 
-    (loom:with-mutex! (loom-cancel-token-lock token)
-      (if-let ((reason-in-lock (loom:cancel-token-reason token)))
-          (loom:schedule-microtasks
-           loom--microtask-scheduler
-           (list (loom:callback
-                  (lambda () (funcall callback reason-in-lock)) 
-                  :type :deferred 
-                  :priority 0))) 
-        (let ((reg (loom:callback callback :type :cancel))) 
-          (cl-pushnew reg (loom-cancel-token-registrations token)
+  (let ((token-name (loom-cancel-token-name token)))
+    ;; This "check-lock-check" pattern handles a potential race condition.
+    ;; First, check without a lock for the common case where the token is not
+    ;; cancelled.
+    (if-let ((reason (and (loom-cancel-token-cancelled-p token)
+                          (loom:cancel-token-reason token))))
+        ;; If already cancelled, execute immediately.
+        (progn
+          (loom-log :debug nil
+                    "Token '%s' already cancelled; running callback immediately."
+                    token-name)
+          (loom:microtask (lambda () (funcall callback reason))))
+      ;; If not cancelled, acquire the lock to safely modify the registration
+      ;; list.
+      (loom:with-mutex! (loom-cancel-token-lock token)
+        ;; Double-check the state inside the lock, in case it was cancelled
+        ;; between the first check and acquiring the lock.
+        (if-let ((reason-in-lock (loom:cancel-token-reason token)))
+            (progn
+              (loom-log :debug nil
+                        "Token '%s' cancelled during lock acquisition; running callback."
+                        token-name)
+              (loom:microtask (lambda () (funcall callback reason-in-lock))))
+          ;; State is still active; it's safe to add the callback.
+          (loom-log :debug nil "Registering new callback for token '%s'."
+                    token-name)
+          (cl-pushnew (loom:callback callback :type :cancel)
+                      (loom-cancel-token-registrations token)
                       :key #'loom-callback-handler-fn
                       :test #'eq)))))
   nil)
 
 ;;;###autoload
 (defun loom:cancel-token-remove-callback (token callback)
-  "Unregister a specific CALLBACK function from a TOKEN.
-This is useful for explicit cleanup if a cancellable task completes
-successfully and no longer needs to listen for cancellation signals.
+  "Unregisters a specific `CALLBACK` function from a `TOKEN`.
+
+This is useful for explicit resource management. If a task that was listening
+for cancellation completes successfully, it should remove its callback to
+avoid being invoked unnecessarily and to allow the token to be garbage
+collected.
 
 Arguments:
 - `TOKEN` (loom-cancel-token): The token to modify.
-- `CALLBACK` (function): The exact function object to remove.
+- `CALLBACK` (function): The exact function object (`eq`) to remove.
 
-Returns:
-- (boolean): `t` if the callback was found and removed, `nil` otherwise.
-
-Signals:
-- `loom-cancel-invalid-token-error`: If `TOKEN` is not a valid
-  `loom-cancel-token` object.
-
-Side Effects:
-- Modifies the `registrations` list of `TOKEN`, removing the specified
-  `CALLBACK` if found."
+Returns: `t` if the callback was found and removed, `nil` otherwise.
+Signals: `loom-cancel-invalid-token-error` if `TOKEN` is invalid."
   (loom--validate-token token 'loom:cancel-token-remove-callback)
-  (let ((removed-p nil))
+  (let (removed-p)
     (loom:with-mutex! (loom-cancel-token-lock token)
       (let* ((registrations (loom-cancel-token-registrations token))
-             (new-registrations (cl-delete
-                                 callback registrations
-                                 :key #'loom-callback-handler-fn
-                                 :test #'eq)))
+             (new-registrations (cl-delete callback registrations
+                                           :key #'loom-callback-handler-fn
+                                           :test #'eq)))
+        ;; If the list length changed, a removal occurred.
         (when (< (length new-registrations) (length registrations))
+          (loom-log :debug nil "Removed callback from token '%s'."
+                    (loom-cancel-token-name token))
           (setq removed-p t)
-          (setf (loom-cancel-token-registrations token) new-registrations))))
+          (setf (loom-cancel-token-registrations token)
+                new-registrations))))
     removed-p))
 
 ;;;###autoload
 (defun loom:cancel-token-linked (source-token &optional name data)
-  "Create a new token that is automatically cancelled when `SOURCE-TOKEN` is.
-This is useful for propagating cancellation down a hierarchy of tasks,
-allowing a parent task's cancellation to automatically cancel its child tasks.
+  "Creates a new token that is automatically cancelled when `SOURCE-TOKEN` is.
+
+This is the primary tool for creating a hierarchy or tree of cancellable
+tasks. If a parent task is cancelled, this mechanism ensures the cancellation
+signal is propagated down to its children.
 
 Arguments:
-- `SOURCE-TOKEN` (loom-cancel-token): The token to chain from.
-- `NAME` (string, optional): A name for the new linked token.
-- `DATA` (any, optional): Data for the new linked token.
+- `SOURCE-TOKEN` (loom-cancel-token): The parent token to chain from.
+- `NAME` (string, optional): A descriptive name for the new linked token.
+- `DATA` (any, optional): User data for the new linked token.
 
-Returns:
-- (loom-cancel-token): The new linked token.
-
-Signals:
-- `loom-cancel-invalid-token-error`: If `SOURCE-TOKEN` is not a valid
-  `loom-cancel-token` object.
-
-Side Effects:
-- Creates a new `loom-cancel-token`.
-- Registers a callback on `SOURCE-TOKEN` that signals the new token
-  upon cancellation."
+Returns: The new linked `loom-cancel-token`.
+Signals: `loom-cancel-invalid-token-error` if `SOURCE-TOKEN` is invalid."
   (loom--validate-token source-token 'loom:cancel-token-linked)
-  (let ((new-token (loom:cancel-token name data)))
+  (let* ((new-name (or name (format "linked-to-%s"
+                                     (loom-cancel-token-name source-token))))
+         (new-token (loom:cancel-token new-name data)))
+    (loom-log :info nil "Creating token '%s' linked to '%s'."
+              new-name (loom-cancel-token-name source-token))
+    ;; Register a simple callback on the source token that will, in turn,
+    ;; signal our new token with the same reason.
     (loom:cancel-token-add-callback
      source-token
      (lambda (reason) (loom:cancel-token-signal new-token reason)))
@@ -313,38 +357,42 @@ Side Effects:
 
 ;;;###autoload
 (defun loom:cancel-token-link-promise (token promise)
-  "Link a TOKEN to a PROMISE, cancelling the token when the promise settles.
-This is a convenient way to manage a token's lifecycle based on a
-promise's outcome. When the `PROMISE` resolves or rejects, the `TOKEN`
-will be signaled as cancelled.
+  "Links a `TOKEN` to a `PROMISE`, cancelling the token when the promise
+settles.
+
+When the `PROMISE` resolves or rejects, the `TOKEN` will be signaled as
+cancelled. This is useful for managing a token that represents the \"scope\"
+of a promise-based operation; the scope ends when the operation ends.
 
 Arguments:
-- `TOKEN` (loom-cancel-token): The token to signal.
-- `PROMISE` (loom-promise): The promise to link to.
+- `TOKEN` (loom-cancel-token): The token to be signaled.
+- `PROMISE` (loom-promise): The promise whose settlement triggers the signal.
 
-Returns:
-- (loom-cancel-token): The `TOKEN` that was linked.
-
-Signals:
-- `loom-cancel-invalid-token-error`: If `TOKEN` is not a valid
-  `loom-cancel-token` object.
-- `error`: If `PROMISE` is not a valid `loom-promise` object.
-
-Side Effects:
-- Attaches a `loom:finally` handler to the `PROMISE` which will signal
-  the `TOKEN` upon the promise's settlement."
+Returns: The `TOKEN` that was linked.
+Signals: `loom-cancel-invalid-token-error` or `error` for invalid arguments."
   (loom--validate-token token 'loom:cancel-token-link-promise)
   (unless (loom-promise-p promise)
-    (error "Argument must be a loom-promise: %S" promise))
+    (error "Argument must be a loom-promise, but got: %S" promise))
+
+  (loom-log :info nil "Linking token '%s' to settlement of promise %S."
+            (loom-cancel-token-name token) (loom-promise-id promise))
+
+  ;; `loom:finally` is perfect for this, as it runs regardless of whether
+  ;; the promise resolves or rejects.
   (loom:finally promise
-              (lambda (_value err)
-              (loom-log :debug nil "Promise %S finally handler triggered for token %S."
-                          (loom-promise-id promise) (loom-cancel-token-name token))
-                (let ((reason (or err
-                                  (loom:make-error
-                                   :type :cancel-link
-                                   :message "Linked promise settled."))))
-                  (loom:cancel-token-signal token reason))))
+                (lambda (_value err)
+                  (loom-log :debug nil
+                            "Promise %S settled; signaling linked token '%S'."
+                            (loom-promise-id promise)
+                            (loom-cancel-token-name token))
+                  ;; The reason for cancellation will be the promise's rejection
+                  ;; error, or a generic message if the promise resolved
+                  ;; successfully.
+                  (let ((reason (or err
+                                    (loom:make-error
+                                     :type :cancel-link
+                                     :message "Linked promise settled successfully."))))
+                    (loom:cancel-token-signal token reason))))
   token)
 
 (provide 'loom-cancel)

@@ -1,27 +1,35 @@
-;;; loom-errors.el --- Error definitions and handling for Concur -*- lexical-binding: t; -*-
+;;; loom-errors.el --- Error definitions and handling for Loom -*- lexical-binding: t; -*-
 ;;
 ;;; Commentary:
 ;;
-;; This file defines the various error types used throughout the Concur library,
+;; This file defines the various error types used throughout the Loom library,
 ;; provides a standardized way to create error objects (`loom:make-error`),
 ;; and manages the configuration for how unhandled promise rejections are treated.
 ;;
 ;; It encapsulates all error-related concerns, making the core promise
 ;; implementation cleaner and error handling more consistent and configurable.
+;;
+;; Key features:
+;; - Rich error objects with contextual information
+;; - Configurable unhandled rejection handling
+;; - Error chaining and inheritance
+;; - Async stack trace support
+;; - Serialization for IPC
+;; - Memory-efficient error tracking
 
 ;;; Code:
 
 (require 'cl-lib)
 
-(require 'loom-log)
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Forward Declarations
 
-(declare-function loom-promise-p "loom-core")
+(declare-function loom-promise-p "loom-promise")
+(declare-function loom:error-value "loom-promise")
+(declare-function loom-log "loom-log")
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Global Context (Error-Related)
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Global Context
 
 (defvar loom-current-async-stack nil
   "A dynamically-scoped list of labels for the current async call stack.
@@ -34,18 +42,27 @@ providing context for `loom-error` objects.")
 (defvar loom--error-id-counter 0
   "Counter for generating unique error IDs.")
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+(defvar loom--error-statistics nil
+  "Statistics about error creation and handling.
+A plist with keys: :total-errors, :unhandled-count, :by-type.")
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Constants
+
+(defconst *loom-error-severity-levels*
+  '(:debug :info :warning :error :critical)
+  "Valid severity levels for loom errors, in increasing order of severity.")
+
+(defconst *loom-error-serializable-slots*
+  '(id type severity code message data timestamp buffer major-mode
+    cmd args cwd exit-code signal process-status stdout stderr context)
+  "A list of `loom-error` slots that can be safely serialized to a plist.")
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Customization
 
 (defcustom loom-on-unhandled-rejection-action 'log
   "Action to take when a promise is rejected with no error handler.
-An unhandled rejection occurs when a promise is rejected, but no `:catch`
-or `on-rejected` handler is attached to it or any of its descendants in
-the promise chain. This can lead to silent failures.
-
-This variable provides a single, unified control for the global
-behavior for reporting such events.
-
 Possible values are:
 - `ignore`: Do nothing.
 - `log`: Log a warning message to the `*Messages*` buffer (default).
@@ -60,71 +77,95 @@ Possible values are:
 
 (defcustom loom-error-max-stack-depth 50
   "Maximum depth for async stack traces to prevent excessive memory usage."
-  :type 'integer
+  :type 'natnum
   :group 'loom)
 
 (defcustom loom-error-max-message-length 1000
   "Maximum length for error messages to prevent excessive memory usage."
-  :type 'integer
+  :type 'natnum
   :group 'loom)
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+(defcustom loom-error-max-unhandled-queue-size 100
+  "Maximum number of unhandled rejections to keep in memory.
+When this limit is reached, oldest errors are discarded."
+  :type 'natnum
+  :group 'loom)
+
+(defcustom loom-error-enable-statistics t
+  "Whether to collect statistics about error creation and handling.
+When enabled, provides insight into error patterns but uses more memory."
+  :type 'boolean
+  :group 'loom)
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Error Definitions
 
-(define-error 'loom-error "A generic error in the Concur library.")
+(define-error 'loom-error 
+  "A generic error in the Concur library.")
 
 (define-error 'loom-unhandled-rejection
-  "A promise was rejected with no attached error handler."
+  "A promise was rejected with no attached error handler." 
   'loom-error)
 
 (define-error 'loom-await-error
-  "An error occurred while awaiting a promise."
+  "An error occurred while awaiting a promise." 
   'loom-error)
 
-(define-error 'loom-cancel-error
-  "A promise was cancelled."
+(define-error 'loom-cancel-error 
+  "A promise was cancelled." 
   'loom-error)
 
-(define-error 'loom-timeout-error
-  "An operation timed out."
+(define-error 'loom-timeout-error 
+  "An operation timed out." 
   'loom-error)
 
-(define-error 'loom-type-error
-  "An invalid type was encountered."
+(define-error 'loom-type-error 
+  "An invalid type was encountered." 
   'loom-error)
 
 (define-error 'loom-executor-error
-  "An error occurred within a promise executor function."
+  "An error occurred within a promise executor function." 
   'loom-error)
 
 (define-error 'loom-callback-error
-  "An error occurred within a promise callback handler."
+  "An error occurred within a promise callback handler." 
   'loom-error)
 
 (define-error 'loom-scheduler-not-initialized-error
-  "Scheduler not initialized"
+  "Scheduler not initialized." 
   'loom-error)
 
 (define-error 'loom-validation-error
-  "A validation check failed"
+  "A validation check failed." 
   'loom-error)
 
 (define-error 'loom-state-error
-  "An invalid state transition was attempted"
+  "An invalid state transition was attempted." 
   'loom-error)
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+(define-error 'loom-resource-error
+  "A resource-related error occurred." 
+  'loom-error)
+
+(define-error 'loom-network-error
+  "A network-related error occurred." 
+  'loom-error)
+
+(define-error 'loom-permission-error
+  "A permission-related error occurred." 
+  'loom-error)
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Struct Definitions
 
 (cl-defstruct (loom-error (:constructor %%make-loom-error) (:copier nil))
   "A standardized error object for promise rejections.
-This provides a consistent structure for error handling, allowing for
-richer introspection than a simple string or Lisp error condition.
 
 Fields:
 - `id` (integer): Unique identifier for this error instance.
 - `type` (keyword): Keyword identifying the error (`:cancel`, `:timeout`).
-- `severity` (symbol): Error severity level (`:debug`, `:info`, `:warning`, `:error`, `:critical`).
+- `severity` (symbol): Error severity level (`:debug`, `:info`, `:warning`,
+  `:error`, `:critical`).
 - `code` (string): Machine-readable error code for programmatic handling.
 - `message` (string): A human-readable error message.
 - `data` (any): Additional structured data associated with the error.
@@ -132,55 +173,47 @@ Fields:
 - `promise` (loom-promise): The promise instance that rejected.
 - `async-stack-trace` (string): Formatted async/Lisp backtrace.
 - `timestamp` (float): Time when the error was created.
-- `buffer` (buffer): The buffer active when the error was created.
-- `major-mode` (symbol): The major mode active at error creation.
-- `cmd` (string): If process-related, the command that was run.
-- `args` (list): If process-related, the command arguments.
-- `cwd` (string): If process-related, the working directory.
-- `exit-code` (integer): If process-related, the process exit code.
-- `signal` (string): If process-related, the signal that killed it.
-- `process-status` (symbol): If process-related, the process status.
-- `stdout` (string): If process-related, collected stdout.
-- `stderr` (string): If process-related, collected stderr.
-- `context` (plist): Additional contextual information."
+- `context` (plist): Additional contextual information.
+- `handled` (boolean): Whether this error has been handled.
+- `chain-depth` (integer): Depth in the error chain."
   (id (cl-incf loom--error-id-counter) :type integer)
   (type :generic :type keyword)
-  (severity :error :type (member :debug :info :warning :error :critical))
+  (severity :error :type symbol)
   (code nil :type (or null string))
-  (message "An unspecific Concur error occurred." :type string)
+  (message "An unspecified Concur error occurred." :type string)
   (data nil)
   (cause nil)
   (promise nil)
   (async-stack-trace nil :type (or null string))
   (timestamp (float-time) :type float)
-  (buffer nil)
-  (major-mode nil :type (or null symbol))
-  (cmd nil :type (or null string))
-  (args nil :type (or null list))
-  (cwd nil :type (or null string))
-  (exit-code nil :type (or null integer))
-  (signal nil :type (or null string))
-  (process-status nil :type (or null symbol))
-  (stdout nil :type (or null string))
-  (stderr nil :type (or null string))
-  (context nil :type (or null list)))
+  (context nil :type (or null list))
+  (handled nil :type boolean)
+  (chain-depth 0 :type integer))
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Internal Helpers
 
 (defun loom--truncate-string (str max-length)
-  "Truncate STR to MAX-LENGTH characters, adding ellipsis if needed."
-  ;; Use `if` instead of `when` to provide an "else" case.
+  "Truncate `STR` to `MAX-LENGTH` characters, adding ellipsis if needed.
+
+Arguments:
+- `STR` (string): The string to truncate.
+- `MAX-LENGTH` (integer): The maximum allowed length.
+
+Returns:
+- (string): The potentially truncated string."
   (if (and (stringp str) (> (length str) max-length))
-      ;; If the string is too long, truncate it.
       (concat (substring str 0 (- max-length 3)) "...")
-    ;; Otherwise, return the original string unchanged.
     str))
 
 (defun loom--format-async-stack ()
-  "Format `loom-current-async-stack` into a readable string."
+  "Format `loom-current-async-stack` into a readable string.
+
+Returns:
+- (string or nil): The formatted stack trace, or nil if the stack is empty."
   (when loom-current-async-stack
-    (let ((stack (if (> (length loom-current-async-stack) loom-error-max-stack-depth)
+    (let ((stack (if (> (length loom-current-async-stack)
+                        loom-error-max-stack-depth)
                      (append (seq-take loom-current-async-stack
                                        (- loom-error-max-stack-depth 1))
                              (list (format "... (%d more frames)"
@@ -190,148 +223,166 @@ Fields:
       (mapconcat #'identity (reverse stack) "\n↳ "))))
 
 (defun loom--validate-error-args (args)
-  "Validate error creation arguments and return normalized args.
-This robust version guards against non-string message types."
-  (let* ((validated-args args)
-         (message-val (plist-get validated-args :message)))
+  "Validate error creation arguments and return a normalized plist.
 
-    ;; Process the message only if it's explicitly provided.
-    (when message-val
-      (let ((message-str (if (stringp message-val)
-                             message-val
-                           (format "%S" message-val)))) ; Coerce to string if not already
-        ;; Put the guaranteed-to-be-a-string back into the plist, after truncation.
-        (setq validated-args
-              (plist-put validated-args :message
-                         (loom--truncate-string message-str loom-error-max-message-length)))))
+Arguments:
+- `ARGS` (plist): The user-provided arguments to `loom:make-error`.
 
-    (let ((type (plist-get validated-args :type))
-          (severity (plist-get validated-args :severity)))
+Returns:
+- (plist): A validated and normalized plist of arguments.
 
-      ;; Validate type and severity...
-      (when (and type (not (keywordp type)))
+Signals:
+- `loom-validation-error`: If type, severity, or code are invalid."
+  (let ((validated-args (copy-sequence args)))
+    (when-let ((message-val (plist-get validated-args :message)))
+      (let ((message-str (if (stringp message-val) message-val
+                           (format "%S" message-val))))
+        (setq validated-args (plist-put validated-args :message
+                                        (loom--truncate-string
+                                         message-str
+                                         loom-error-max-message-length)))))
+    (when-let ((type (plist-get validated-args :type)))
+      (unless (keywordp type)
         (signal 'loom-validation-error
-                (list "Error type must be a keyword" :type type)))
-      (when (and severity (not (memq severity '(:debug :info :warning :error :critical))))
+                (list "Error type must be a keyword" :type type))))
+    (when-let ((severity (plist-get validated-args :severity)))
+      (unless (memq severity *loom-error-severity-levels*)
         (signal 'loom-validation-error
                 (list "Invalid severity level" :severity severity))))
-
+    (when-let ((code (plist-get validated-args :code)))
+      (unless (stringp code)
+        (signal 'loom-validation-error
+                (list "Error code must be a string" :code code))))
     validated-args))
 
 (defun loom--inherit-from-cause (cause user-args)
-  "Inherit appropriate fields from CAUSE error if it's a loom-error.
+  "Inherit appropriate fields from a `CAUSE` if it's a `loom-error`.
 
 Arguments:
 - `CAUSE` (any): The cause to potentially inherit from.
 - `USER-ARGS` (plist): User-provided arguments that take precedence.
 
 Returns:
-- (plist): Arguments with inherited values added."
+- (plist): A new plist with inherited values added."
   (if (not (loom-error-p cause))
       user-args
-    (let ((inherited-args user-args))
-      ;; Fields that should be inherited if not explicitly provided
-      (dolist (slot '(type severity code async-stack-trace buffer major-mode
-                      cmd args cwd exit-code signal process-status stdout stderr))
+    (let ((inherited-args (copy-sequence user-args)))
+      (dolist (slot '(type severity code async-stack-trace))
         (let* ((key (intern (format ":%s" slot)))
                (val (funcall (intern (format "loom-error-%s" slot)) cause)))
           (when (and val (not (plist-member inherited-args key)))
             (setq inherited-args (plist-put inherited-args key val)))))
+      (let ((parent-depth (loom-error-chain-depth cause)))
+        (unless (plist-member inherited-args :chain-depth)
+          (setq inherited-args
+                (plist-put inherited-args :chain-depth (1+ parent-depth)))))
       inherited-args)))
 
-(defun loom--get-message-from-cause (cause)
-  "Extracts a string message from an arbitrary CAUSE object.
-  Handles loom-errors, standard Emacs Lisp errors, and any other Lisp object."
-  (let ((msg nil))
-    (cond
-     ((loom-error-p cause)
-      (setq msg (loom-error-message cause)))
-     ;; Handle standard (error "MESSAGE") lists directly.
-     ;; (stringp (cadr cause)) ensures it's a string message, not just any data.
-     ((and (listp cause) (eq (car cause) 'error) (stringp (cadr cause)))
-      (setq msg (cadr cause)))
-     ;; Try `error-message-string` for other types of Emacs Lisp errors.
-     (t
-      (setq msg (error-message-string cause))))
+(defun loom--extract-message-from-cause (cause)
+  "Extract a string message from an arbitrary `CAUSE` object.
 
-    ;; Ensure `msg` is a non-empty string, otherwise use a fallback.
-    (if (and (stringp msg) (not (string-empty-p msg)) (not (string= msg "nil")))
-        msg ; Return the good message
-      (format "Unknown error cause: %S" cause)))) ; Generic fallback
+Arguments:
+- `CAUSE` (any): The object from which to extract a message.
 
+Returns:
+- (string): The extracted error message."
+  (cond
+   ((loom-error-p cause) (loom-error-message cause))
+   ((and (listp cause) (symbolp (car cause))) (error-message-string cause))
+   ((stringp cause) cause)
+   (t (format "%S" cause))))
+
+(defun loom--update-error-statistics (error-obj)
+  "Update error statistics if enabled.
+
+Arguments:
+- `ERROR-OBJ` (loom-error): The newly created error.
+
+Returns: `nil`.
+Side Effects: Modifies `loom--error-statistics`."
+  (when loom-error-enable-statistics
+    (unless loom--error-statistics
+      (setq loom--error-statistics `(:total-errors 0 :unhandled-count 0
+                                     :by-type ,(make-hash-table :test 'eq))))
+    (cl-incf (plist-get loom--error-statistics :total-errors))
+    (let ((by-type (plist-get loom--error-statistics :by-type))
+          (type (loom-error-type error-obj)))
+      (puthash type (1+ (gethash type by-type 0)) by-type))))
+
+(defun loom--manage-unhandled-queue ()
+  "Manage the unhandled rejections queue size, removing oldest entries.
+
+Returns: `nil`.
+Side Effects: May modify `loom--unhandled-rejections-queue`."
+  (while (> (length loom--unhandled-rejections-queue)
+            loom-error-max-unhandled-queue-size)
+    (setq loom--unhandled-rejections-queue
+          (cdr loom--unhandled-rejections-queue))))
 
 (defun loom--handle-unhandled-rejection (error-obj)
   "Handle an unhandled rejection according to configuration.
 
 Arguments:
-- `ERROR-OBJ` (loom-error): The unhandled error object."
+- `ERROR-OBJ` (loom-error): The unhandled error.
+
+Returns: `nil`.
+Side Effects: Adds error to queue and executes the configured action."
   (push error-obj loom--unhandled-rejections-queue)
+  (loom--manage-unhandled-queue)
+  (when loom-error-enable-statistics
+    (cl-incf (plist-get loom--error-statistics :unhandled-count)))
   (pcase loom-on-unhandled-rejection-action
     ('ignore nil)
-    ('log (loom--log-unhandled-rejection error-obj))
+    ('log (loom-log :warning nil "Unhandled promise rejection [%s]: %s"
+                    (loom-error-type error-obj) (loom-error-message error-obj)))
     ('signal (signal 'loom-unhandled-rejection
                      (list "Unhandled promise rejection" error-obj)))
     ((pred functionp)
-     (condition-case err
-         (funcall loom-on-unhandled-rejection-action error-obj)
-       (error (loom-log :error nil "Error in unhandled rejection handler: %S" err))))
-    (_ (loom-log :warning nil "Invalid loom-on-unhandled-rejection-action: %S"
-                loom-on-unhandled-rejection-action))))
+     (condition-case err (funcall loom-on-unhandled-rejection-action error-obj)
+       (error (loom-log :error nil "Error in unhandled rejection handler: %S" err))))))
 
-(defun loom--log-unhandled-rejection (error-obj)
-  "Log an unhandled rejection to the message buffer.
+(defun loom--capture-context ()
+  "Capture current execution context for error reporting.
 
-Arguments:
-- `ERROR-OBJ` (loom-error): The error to log."
-  (loom-log :warning nil "Unhandled promise rejection [%s]: %s"
-           (loom-error-type error-obj)
-           (loom-error-message error-obj)))
+Returns:
+- (plist): A plist with relevant contextual information."
+  `(:buffer ,(buffer-name (current-buffer))
+    :major-mode ,major-mode
+    :point ,(point)
+    :emacs-version ,emacs-version
+    :system-type ,system-type))
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Public API
 
 ;;;###autoload
 (defun loom:make-error (&rest user-args)
   "Create a new `loom-error` struct, capturing contextual information.
-This function intelligently builds an error object. If the `:cause`
-is another `loom-error`, its properties are inherited. Explicitly
-provided arguments in `USER-ARGS` always take precedence.
+If the `:cause` is another `loom-error`, its properties are inherited.
+Explicitly provided arguments in `USER-ARGS` always take precedence.
 
 Arguments:
 - `USER-ARGS` (plist): Key-value pairs for `loom-error` fields.
-  Common keys include `:type`, `:message`, `:data`, and `:cause`.
 
 Returns:
 - (loom-error): A new, populated `loom-error` struct.
 
 Signals:
-- `loom-validation-error` if invalid arguments are provided."
+- `loom-validation-error`: If invalid arguments are provided."
   (let* ((validated-args (loom--validate-error-args user-args))
          (cause (plist-get validated-args :cause))
-         (user-message (plist-get validated-args :message)) ; This will now be nil if no :message was passed in user-args
          (defaults `(:async-stack-trace ,(loom--format-async-stack)
-                     :buffer ,(current-buffer)
-                     :major-mode ,major-mode
-                     :timestamp ,(float-time)))
-         (inherited (when (loom-error-p cause)
-                      (loom--inherit-from-cause cause validated-args)))
-         (derived-message
-          (cond
-           (user-message user-message) ; User-provided message has highest priority
-           (cause (loom--get-message-from-cause cause)) ; Use the robust helper
-           (t "An unspecified Concur error occurred."))))
-
-    ;; (message "cause for %%make-loom-error: %S" cause)        ; Keep for debugging
-    ;; (message "derived-message for %%make-loom-error: %S" derived-message) ; Keep for debugging
-    (let ((final-args (append validated-args inherited defaults)))
-      ;; Ensure the derived message is explicitly set, overriding any default
-      ;; This `plist-put` is essential even if `validated-args` has no `:message`
-      ;; because we're providing the *final, derived* message.
-      (setq final-args (plist-put final-args :message derived-message))
-
-      ;; (message "final-args for %%make-loom-error: %S" final-args) ; Keep for debugging
-
-      (apply #'%%make-loom-error final-args))))
+                     :context ,(loom--capture-context)))
+         (inherited (if cause (loom--inherit-from-cause cause validated-args)
+                      '()))
+         (derived-message (or (plist-get validated-args :message)
+                              (if cause (loom--extract-message-from-cause cause))
+                              "An unspecified Concur error occurred."))
+         (final-args (append validated-args inherited defaults)))
+    (setq final-args (plist-put final-args :message derived-message))
+    (let ((error-obj (apply #'%%make-loom-error final-args)))
+      (loom--update-error-statistics error-obj)
+      error-obj)))
 
 ;;;###autoload
 (defun loom:error-from-condition (condition &rest additional-args)
@@ -345,9 +396,7 @@ Returns:
 - (loom-error): A new error object wrapping the condition."
   (let* ((error-symbol (car condition))
          (error-data (cdr condition))
-         (message (if error-data
-                      (format "%s: %s" error-symbol (car error-data))
-                    (format "%s" error-symbol))))
+         (message (error-message-string condition)))
     (apply #'loom:make-error
            :type (intern (format ":%s" error-symbol))
            :message message
@@ -366,15 +415,12 @@ Arguments:
 Returns:
 - (loom-error): A new error object wrapping the cause."
   (cond
-   ((loom-error-p cause) cause)
-   ((and (listp cause) (symbolp (car cause))) ; Error condition
+   ((and (loom-error-p cause) (null additional-args)) cause)
+   ((loom-error-p cause) (apply #'loom:make-error :cause cause additional-args))
+   ((and (listp cause) (symbolp (car cause)))
     (apply #'loom:error-from-condition cause additional-args))
-   (t
-    (apply #'loom:make-error
-           :cause cause
-           :message (format "Wrapped error: %S" cause) ; This is a default message for unknown cause types
-           additional-args))))
-    
+   (t (apply #'loom:make-error :cause cause additional-args))))
+
 ;;;###autoload
 (defun loom:error-message (promise-or-error)
   "Return human-readable message from a promise's error or an error object.
@@ -387,57 +433,78 @@ Returns:
   (let ((err (if (loom-promise-p promise-or-error)
                  (loom:error-value promise-or-error)
                promise-or-error)))
-    (cond
-     ((loom-error-p err) (loom-error-message err))
-     ((stringp err) err)
-     (t (format "%S" err)))))
+    (loom--extract-message-from-cause err)))
 
 ;;;###autoload
 (defun loom:error-cause (err)
   "Return the underlying cause of a `loom-error`.
 
-The 'cause' is the original Lisp error or reason that triggered
-the creation of this `loom-error` object. This function serves as
-the public API accessor for the `:cause` slot.
-
 Arguments:
-- ERR (loom-error): The error object to inspect.
+- `ERR` (loom-error): The error object to inspect.
 
 Returns:
 - (any): The underlying cause, or `nil` if none.
 
 Signals:
-- `loom-type-error`: If ERR is not a `loom-error` struct."
+- `loom-type-error`: If `ERR` is not a `loom-error` struct."
   (unless (loom-error-p err)
     (signal 'loom-type-error (list "Expected loom-error" err)))
-  ;; This calls the accessor function automatically generated by cl-defstruct.
   (loom-error-cause err))
-    
+
+;;;###autoload
+(defun loom:error-mark-handled (err)
+  "Mark an error as handled.
+
+Arguments:
+- `ERR` (loom-error): The error to mark as handled.
+
+Returns:
+- (loom-error): The same error object.
+
+Signals:
+- `loom-type-error`: If `ERR` is not a `loom-error` struct."
+  (unless (loom-error-p err)
+    (signal 'loom-type-error (list "Expected loom-error" err)))
+  (setf (loom-error-handled err) t)
+  err)
+
+;;;###autoload
+(defun loom:error-handled-p (err)
+  "Check if an error has been marked as handled.
+
+Arguments:
+- `ERR` (loom-error): The error to check.
+
+Returns:
+- (boolean): `t` if handled, `nil` otherwise.
+
+Signals:
+- `loom-type-error`: If `ERR` is not a `loom-error` struct."
+  (unless (loom-error-p err)
+    (signal 'loom-type-error (list "Expected loom-error" err)))
+  (loom-error-handled err))
+
 ;;;###autoload
 (defun loom:serialize-error (err)
-  "Serialize a `loom-error` struct into a plist.
-This plist can then be safely encoded as JSON for Inter-Process
-Communication.
+  "Serialize a `loom-error` struct into a plist for IPC.
 
 Arguments:
 - `ERR` (loom-error): The error object to serialize.
 
 Returns:
-- (list): A plist representation of the error."
+- (list): A plist representation of the error.
+
+Signals:
+- `loom-type-error`: If `ERR` is not a `loom-error` struct."
   (unless (loom-error-p err)
     (signal 'loom-type-error (list "Expected loom-error" err)))
-
-  (cl-loop with slots = '(id type severity code message data cause promise
-                             async-stack-trace timestamp buffer major-mode
-                             cmd args cwd exit-code signal process-status
-                             stdout stderr context)
+  (cl-loop with slots = *loom-error-serializable-slots*
            for slot-name in slots
-           for value = (funcall (intern (format "loom-error-%s" slot-name)) err)
+           for value = (funcall (intern (format "loom-error-%s" slot-name))
+                                err)
            when value
            collect (intern (format ":%s" slot-name))
-           collect (if (bufferp value)
-                       (buffer-name value)
-                     value)))
+           collect (if (bufferp value) (buffer-name value) value)))
 
 ;;;###autoload
 (defun loom:deserialize-error (plist)
@@ -447,10 +514,12 @@ Arguments:
 - `PLIST` (list): A property list created by `loom:serialize-error`.
 
 Returns:
-- (loom-error): A new `loom-error` struct."
+- (loom-error): A new `loom-error` struct.
+
+Signals:
+- `loom-type-error`: If `PLIST` is not a list."
   (unless (listp plist)
     (signal 'loom-type-error (list "Expected plist" plist)))
-
   (apply #'%%make-loom-error plist))
 
 ;;;###autoload
@@ -462,21 +531,26 @@ Arguments:
 - `DETAILED` (boolean): Whether to include detailed information.
 
 Returns:
-- (string): A formatted error string."
+- (string): A formatted error string.
+
+Signals:
+- `loom-type-error`: If `ERR` is not a `loom-error` struct."
   (unless (loom-error-p err)
     (signal 'loom-type-error (list "Expected loom-error" err)))
-
-  (let ((basic (format "[%s] %s"
-                       (loom-error-type err)
-                       (loom-error-message err))))
+  (let ((basic (format "[%s:%s] %s" (loom-error-type err)
+                       (loom-error-severity err) (loom-error-message err))))
     (if detailed
-        (concat basic
-                (when (loom-error-code err)
-                  (format "\nCode: %s" (loom-error-code err)))
-                (when (loom-error-data err)
-                  (format "\nData: %S" (loom-error-data err)))
-                (when (loom-error-async-stack-trace err)
-                  (format "\nAsync Stack:\n%s" (loom-error-async-stack-trace err))))
+        (let ((parts (list basic)))
+          (when-let ((code (loom-error-code err)))
+            (push (format "Code: %s" code) parts))
+          (when-let ((data (loom-error-data err)))
+            (push (format "Data: %S" data) parts))
+          (when-let ((depth (loom-error-chain-depth err)))
+            (when (> depth 0)
+              (push (format "Chain Depth: %d" depth) parts)))
+          (when-let ((stack (loom-error-async-stack-trace err)))
+            (push (format "Async Stack:\n%s" stack) parts))
+          (string-join (nreverse parts) "\n"))
       basic)))
 
 ;;;###autoload
@@ -488,10 +562,12 @@ Arguments:
 - `TYPE-OR-CODE` (keyword or string): The type or code to match against.
 
 Returns:
-- (boolean): `t` if the error matches, `nil` otherwise."
+- (boolean): `t` if the error matches, `nil` otherwise.
+
+Signals:
+- `loom-type-error`: If `ERR` is not a `loom-error` struct."
   (unless (loom-error-p err)
     (signal 'loom-type-error (list "Expected loom-error" err)))
-
   (if (keywordp type-or-code)
       (eq (loom-error-type err) type-or-code)
     (string= (loom-error-code err) type-or-code)))
@@ -504,17 +580,75 @@ Arguments:
 - `ERR` (loom-error): The error to get the chain for.
 
 Returns:
-- (list): A list of errors from root cause to current."
+- (list): A list of errors from root cause to current error.
+
+Signals:
+- `loom-type-error`: If `ERR` is not a `loom-error` struct."
   (unless (loom-error-p err)
     (signal 'loom-type-error (list "Expected loom-error" err)))
-
-  (let ((chain (list err))
-        (current err))
-    (while (and (loom-error-p (loom-error-cause current))
-                (< (length chain) 50)) ; Prevent infinite loops
-      (setq current (loom-error-cause current))
+  (let ((chain (list err)) (current err) (max-depth 50))
+    (while (and (setq current (loom-error-cause current))
+                (loom-error-p current)
+                (> (cl-decf max-depth) 0))
       (push current chain))
-    (reverse chain)))
+    (nreverse chain)))
+
+;;;###autoload
+(defun loom:error-root-cause (err)
+  "Get the root cause of an error chain.
+
+Arguments:
+- `ERR` (loom-error): The error to trace back.
+
+Returns:
+- (any): The root cause (may not be a loom-error).
+
+Signals:
+- `loom-type-error`: If `ERR` is not a `loom-error` struct."
+  (unless (loom-error-p err)
+    (signal 'loom-type-error (list "Expected loom-error" err)))
+  (let ((current err) (max-depth 50))
+    (while (and (loom-error-p (loom-error-cause current))
+                (> (cl-decf max-depth) 0))
+      (setq current (loom-error-cause current)))
+    (or (loom-error-cause current) current)))
+
+;;;###autoload
+(defun loom:error-severity-p (err severity)
+  "Check if an error has a specific severity level.
+
+Arguments:
+- `ERR` (loom-error): The error to check.
+- `SEVERITY` (symbol): The severity level to check for.
+
+Returns:
+- (boolean): `t` if the error has the specified severity.
+
+Signals:
+- `loom-type-error`: If `ERR` is not a `loom-error` struct."
+  (unless (loom-error-p err)
+    (signal 'loom-type-error (list "Expected loom-error" err)))
+  (eq (loom-error-severity err) severity))
+
+;;;###autoload
+(defun loom:error-severity>= (err severity)
+  "Check if an error has severity greater than or equal to the given level.
+
+Arguments:
+- `ERR` (loom-error): The error to check.
+- `SEVERITY` (symbol): The minimum severity level.
+
+Returns:
+- (boolean): `t` if the error severity is >= the specified level.
+
+Signals:
+- `loom-type-error`: If `ERR` is not a `loom-error` struct."
+  (unless (loom-error-p err)
+    (signal 'loom-type-error (list "Expected loom-error" err)))
+  (let ((err-level (cl-position (loom-error-severity err)
+                                *loom-error-severity-levels*))
+        (check-level (cl-position severity *loom-error-severity-levels*)))
+    (and err-level check-level (>= err-level check-level))))
 
 ;;;###autoload
 (defun loom-unhandled-rejections-count ()
@@ -530,7 +664,7 @@ Returns:
 
 Returns:
 - (list): A list of `loom-error` objects, oldest first."
-  (prog1 (nreverse loom--unhandled-rejections-queue)
+  (prog1 (reverse loom--unhandled-rejections-queue)
     (setq loom--unhandled-rejections-queue '())))
 
 ;;;###autoload
@@ -557,29 +691,50 @@ Returns:
 Arguments:
 - `ERROR-OBJ` (loom-error): The error object representing the rejection.
 
-Side Effects:
-- Adds the error to the unhandled rejections queue.
-- Triggers the configured unhandled rejection action."
+Returns: `nil`.
+Signals: `loom-type-error`.
+Side Effects: Adds error to queue and triggers unhandled rejection action."
   (unless (loom-error-p error-obj)
     (signal 'loom-type-error (list "Expected loom-error" error-obj)))
-
-  (loom--handle-unhandled-rejection error-obj))
+  (loom--handle-unhandled-rejection error-obj)
+  nil)
 
 ;;;###autoload
 (defmacro loom:with-error-context (context &rest body)
-  "Execute BODY with additional error context.
+  "Execute `BODY` with additional error context.
+Any `loom-error` created within `BODY` will have the `CONTEXT` plist
+merged into its `:context` field.
 
 Arguments:
-- `CONTEXT` (plist): Context to add to errors created within BODY.
+- `CONTEXT` (plist): Context to add to errors created within `BODY`.
 - `BODY` (forms): The forms to execute.
 
 Returns:
-- The value of the last form in BODY."
-  (declare (indent 1))
+- The value of the last form in `BODY`."
+  (declare (indent 1) (debug t))
   `(let ((loom-current-async-stack
-          (cons (format "Context: %S" ,context)
-                loom-current-async-stack)))
+          (cons (format "Context: %S" ,context) loom-current-async-stack)))
      ,@body))
+
+;;;###autoload
+(defun loom:error-statistics ()
+  "Return a snapshot of error statistics if enabled.
+
+Returns:
+- (plist or nil): A plist of statistics or nil if tracking is disabled."
+  (when loom-error-enable-statistics
+    (copy-tree loom--error-statistics)))
+
+;;;###autoload
+(defun loom:reset-error-statistics ()
+  "Reset all error statistics.
+
+Returns: `nil`.
+Side Effects: Clears the `loom--error-statistics` variable."
+  (when loom-error-enable-statistics
+    (setq loom--error-statistics nil)
+    (loom-log :info nil "Loom error statistics have been reset."))
+  nil)
 
 (provide 'loom-errors)
 ;;; loom-errors.el ends here

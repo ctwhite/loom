@@ -5,7 +5,7 @@
 ;; This file defines the fundamental functions for chaining and handling promise
 ;; outcomes: `loom:then`, `loom:catch`, `loom:finally`, and `loom:tap`.
 ;; These build upon the core promise object and internal callback mechanisms
-;; defined in `loom-core.el`.
+;; defined in `loom-promise.el`.
 ;;
 ;; They provide the primary, user-facing interface for building asynchronous
 ;; workflows, adhering to the Promise/A+ specification for handler attachment
@@ -16,37 +16,72 @@
 (require 'cl-lib)
 
 (require 'loom-errors)
-(require 'loom-callback) 
+(require 'loom-callback)
 (require 'loom-promise)
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Internal Helpers
+
+(defun loom--find-and-run-catch-handler (handlers err)
+  "Find and execute the appropriate error handler for ERR.
+This is a helper for `loom:catch`. It returns a cons cell `(FOUND . RESULT)`
+where FOUND is t if a handler was run, and RESULT is its return value.
+
+Arguments:
+- `HANDLERS` (list): The handler specifications from `loom:catch`.
+- `ERR` (loom-error): The error to be handled.
+
+Returns:
+- (cons): A cell `(t . value)` on success, or `(nil)` if no handler matched."
+  (let ((is-simple-handler (or (null handlers) (not (keywordp (car handlers))))))
+    (if is-simple-handler
+        ;; --- Case 1: A single, simple handler ---
+        (if-let ((handler (car handlers)))
+            (cons t (funcall handler err))
+          (cons nil nil)) ; No handler provided.
+      ;; --- Case 2: Typed handlers ---
+      (let* ((err-type (and (loom-error-p err) (loom-error-type err)))
+             (handler-list handlers)
+             (default-handler nil))
+        ;; Isolate the default handler if it exists at the end.
+        (when (and handler-list (functionp (car (last handler-list))))
+          (setq default-handler (car (last handler-list)))
+          (setq handler-list (butlast handler-list)))
+
+        ;; Find and run the first matching typed handler.
+        (cl-loop for (key type-spec handler) on handler-list by #'cdddr
+                 if (and (eq key :type)
+                         (or (eq t type-spec)
+                             (eq err-type type-spec)
+                             (and (listp type-spec) (memq err-type type-spec))))
+                 return (cons t (funcall handler err)))
+
+        ;; If no typed handler matched, try the default handler.
+        (if default-handler
+            (cons t (funcall default-handler err))
+          (cons nil nil)))))) ; No handler matched at all.
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Public API: Attaching Callbacks
 
 ;;;###autoload
 (defun loom:then (promise on-resolved &optional on-rejected)
   "The primary function for promise composition (implements Promises/A+ `then`).
-
 Attaches `ON-RESOLVED` and `ON-REJECTED` handlers to a `PROMISE`,
 returning a new promise that is resolved or rejected by the return
 value of these handlers.
 
-If the input `PROMISE` is not a promise, it is treated as an
-already-resolved promise with that value.
-
 Arguments:
 - `PROMISE` (any): The promise or value to attach handlers to.
 - `ON-RESOLVED` (function): Handler `(lambda (value))` for success.
-  If it returns a promise, the new promise will adopt its state.
-- `ON-REJECTED` (function, optional): Handler `(lambda (error))`
-  for failure. If omitted, defaults to a handler that propagates
-  the error, allowing it to be caught by a later `loom:catch`.
+- `ON-REJECTED` (function, optional): Handler `(lambda (error))` for failure.
 
 Returns:
 - (loom-promise): A new promise representing the outcome of the handler.
 
 Signals:
-- `loom-error` of type `:callback-error` if a provided handler
-  function itself raises an error during its execution.
+- Rejects the returned promise with a `:callback-error` if a handler
+  function itself raises an error.
 
 Side Effects:
 - Schedules the execution of `ON-RESOLVED` or `ON-REJECTED` on
@@ -54,29 +89,30 @@ Side Effects:
   (let* ((source-promise (if (loom-promise-p promise)
                              promise
                            (loom:resolved! promise)))
+         ;; Spec 2.2.7: `then` must return a promise.
          (new-promise (loom:promise
                        :name (format "then-%S" (loom-promise-id source-promise))
                        :parent-promise source-promise))
          (source-id (loom-promise-id source-promise))
          (target-id (loom-promise-id new-promise))
-         ;; Capture the async stack lexically at creation time. This value is
-         ;; "closed over" by the lambdas below and will be available when they
-         ;; are eventually executed.
          (captured-async-stack loom-current-async-stack))
     (loom-attach-callbacks
      source-promise
      ;; on-resolved handler wrapper
      (loom:callback
-      (lambda (target-promise res) 
+      (lambda (target-promise res)
         (let ((label (format "on-resolved (%S -> %S)" source-id target-id)))
-          ;; Rebind the dynamic variable when the async handler runs.
           (cl-letf (((symbol-value 'loom-current-async-stack)
                      (cons label captured-async-stack)))
             (condition-case err
+                ;; Spec 2.2.7.1: If onResolved returns a value x,
+                ;; run [[Resolve]](promise2, x).
                 (loom:resolve target-promise (funcall on-resolved res))
+              ;; Spec 2.2.7.2: If onResolved throws an exception e,
+              ;; promise2 must be rejected with e as the reason.
               (error (loom:reject target-promise
                                     (loom:make-error :type :callback-error
-                                                       :cause err)))))))
+                                                     :cause err)))))))
       :type :resolved
       :source-promise-id source-id
       :promise-id target-id)
@@ -86,16 +122,17 @@ Side Effects:
           ;; If the user provided an on-rejected handler, wrap it.
           (lambda (target-promise err)
             (let ((label (format "on-rejected (%S -> %S)" source-id target-id)))
-              ;; Rebind here as well, using the lexically captured stack.
               (cl-letf (((symbol-value 'loom-current-async-stack)
                          (cons label captured-async-stack)))
                 (condition-case handler-err
+                    ;; Spec 2.2.7.1
                     (loom:resolve target-promise (funcall on-rejected err))
+                  ;; Spec 2.2.7.2
                   (error (loom:reject target-promise
                                         (loom:make-error :type :callback-error
-                                                           :cause handler-err)))))))
-        ;; If no handler is provided, create a default one
-        ;; that propagates the error to the next link in the chain.
+                                                         :cause handler-err)))))))
+        ;; Spec 2.2.7.4: If onRejected is not a function, promise2
+        ;; must be rejected with the same reason as promise1.
         (lambda (target-promise err)
           (loom:reject target-promise err)))
       :type :rejected
@@ -106,15 +143,14 @@ Side Effects:
 ;;;###autoload
 (defun loom:catch (promise &rest handlers)
   "Attach an error handler to a promise, with optional type filtering.
-
 This is a more convenient syntax for the `on-rejected` argument of
 `loom:then`. It allows successful values to pass through untouched.
 
 Handlers can be provided in two forms:
 1. A single function `(lambda (error))` that handles all errors.
 2. A plist of `:type` specifications and handler functions, e.g.,
-   `(:type :foo #'handle-foo :type :bar #'handle-bar)`. An optional
-   final function can act as a default case.
+   `(:type :foo #'handle-foo)`. An optional final function can act
+   as a default case.
 
 Arguments:
 - `PROMISE` (any): The promise or value to attach handlers to.
@@ -126,8 +162,8 @@ Returns:
   on failure.
 
 Signals:
-- `loom-error` of type `:callback-error` if a matched handler
-  function itself raises an error.
+- Rejects the returned promise with a `:callback-error` if a matched
+  handler function itself raises an error.
 
 Side Effects:
 - Schedules handler execution on the microtask queue if `PROMISE` rejects."
@@ -141,9 +177,10 @@ Side Effects:
          (target-id (loom-promise-id new-promise)))
     (loom-attach-callbacks
      source-promise
-     ;; on-resolved: A simple pass-through for successful values.
+     ;; Spec 2.2.7.3: If onResolved is not a function, promise2 must be
+     ;; fulfilled with the same value as promise1. This is our pass-through.
      (loom:callback
-      (lambda (target-promise value) (loom:resolve target-promise value)) 
+      (lambda (target-promise value) (loom:resolve target-promise value))
       :type :resolved
       :source-promise-id source-id
       :promise-id target-id)
@@ -152,54 +189,17 @@ Side Effects:
      (loom:callback
       (lambda (target-promise err)
         (condition-case handler-err
-            ;; --- Main handler logic, now safely wrapped ---
-            (let* ((is-simple-handler (or (null handlers) (not (keywordp (car handlers)))))
-                   (handler-found nil)
-                   (result nil))
-
-              (if is-simple-handler
-                  ;; --- Case 1: A single, simple handler ---
-                  (let ((handler (car handlers)))
-                    (if handler
-                        (progn
-                          (setq result (funcall handler err))
-                          (setq handler-found t))
-                      ;; No handler provided, so it's a re-rejection.
-                      (loom:reject target-promise err)))
-
-                ;; --- Case 2: Typed handlers ---
-                (let* ((err-type (and (loom-error-p err) (loom:error-type err)))
-                       (handler-list handlers)
-                       (default-handler nil))
-                  ;; Isolate the default handler if it exists.
-                  (when (and handler-list (functionp (car (last handler-list))))
-                    (setq default-handler (car (last handler-list)))
-                    (setq handler-list (butlast handler-list)))
-
-                  ;; Find the first matching typed handler.
-                  (cl-loop for (key type-spec handler) on handler-list by #'cdddr
-                           when (and (eq key :type)
-                                     (or (eq t type-spec)
-                                         (eq err-type type-spec)
-                                         (and (listp type-spec) (memq err-type type-spec)))
-                                     (not handler-found))
-                           do (setq result (funcall handler err)
-                                    handler-found t))
-
-                  ;; If no typed handler matched, try the default handler.
-                  (when (and (not handler-found) default-handler)
-                    (setq result (funcall default-handler err))
-                    (setq handler-found t))))
-
+            (let* ((handler-result (loom--find-and-run-catch-handler handlers err))
+                   (handler-found (car handler-result))
+                   (result (cdr handler-result)))
               (if handler-found
                   (loom:resolve target-promise result)
-                ;; If no handler was found at all, re-reject.
+                ;; If no handler was found, re-reject with the original error.
                 (loom:reject target-promise err)))
-
-          ;; --- Error handling for the handler function itself ---
+          ;; If the handler itself throws an error, reject the new promise.
           (error (loom:reject target-promise
                                 (loom:make-error :type :callback-error
-                                                   :cause handler-err)))))
+                                                 :cause handler-err)))))
       :type :rejected
       :source-promise-id source-id
       :promise-id target-id))
@@ -207,17 +207,12 @@ Side Effects:
 
 (defun loom:finally (promise callback-fn)
   "Attach a callback to run when `PROMISE` settles (resolves or rejects).
-
 This is useful for cleanup operations that must occur regardless of
 the promise's outcome (e.g., closing a file, stopping a spinner).
-The outcome of the original `PROMISE` is passed through to the returned
-promise, but only after the `CALLBACK-FN` has completed.
 
 Arguments:
 - `PROMISE` (any): The promise or value to attach the cleanup action to.
-- `CALLBACK-FN` (function): A nullary function `(lambda () ...)` to
-  execute for its side effects. Its return value can be a promise,
-  which will be awaited before the chain continues.
+- `CALLBACK-FN` (function): A nullary function `(lambda () ...)` to execute.
 
 Returns:
 - (loom-promise): A new promise that settles with the original
@@ -233,80 +228,63 @@ Side Effects:
   (let* ((source-promise (if (loom-promise-p promise)
                              promise
                            (loom:resolved! promise)))
-         ;; The new promise that will be returned to the user.
          (target-promise (loom:promise
                           :name (format "finally-%S" (loom-promise-id source-promise))
                           :parent-promise source-promise))
          (source-id (loom-promise-id source-promise))
          (target-id (loom-promise-id target-promise)))
-    
-    ;; `handle-callback` is a local helper function that orchestrates the
-    ;; complex chaining required by `finally`.
-    (cl-flet ((handle-callback (original-outcome resolve-with-original-p)
+
+    ;; `handle-callback` is a local helper that orchestrates the complex
+    ;; chaining required by `finally`.
+    (cl-flet ((handle-callback (original-outcome is-resolved)
                 (condition-case cb-err
                     (let* (;; 1. Execute the user's side-effect callback.
-                           (callback-result (funcall callback-fn))
-                           ;; 2. The callback itself might return a promise, so we
+                           (cb-result (funcall callback-fn))
+                           ;; 2. The callback might return a promise, so we
                            ;;    normalize its result into one.
-                           (callback-promise (if (loom-promise-p callback-result)
-                                                 callback-result
-                                               (loom:resolved! callback-result)))
-                           (callback-id (loom-promise-id callback-promise)))
-                      ;; 3. We now wait for the callback's promise to settle
-                      ;;    before we settle the main `target-promise`.
-                      (loom-attach-callbacks 
-                       callback-promise
-                       ;; If the side-effect callback succeeds...
-                       (loom:callback
-                        (lambda (_tp _v) 
-                          ;; ...settle our target promise with the
-                          ;; original promise's outcome.
-                          (if resolve-with-original-p
-                              (loom:resolve target-promise original-outcome)
-                            (loom:reject target-promise original-outcome)))
-                        :type :resolved
-                        :source-promise-id callback-id
-                        :promise-id target-id)
-                       ;; If the side-effect callback fails...
-                       (loom:callback
-                        (lambda (_tp cb-reason)
-                          ;; ...reject our target promise with the
-                          ;; new error from the callback.
-                          (loom:reject target-promise cb-reason))
-                        :type :rejected
-                        :source-promise-id callback-id
-                        :promise-id target-id)))
-                  ;; If the side-effect function itself throws a synchronous error,
+                           (cb-promise (if (loom-promise-p cb-result)
+                                           cb-result
+                                         (loom:resolved! cb-result))))
+                      ;; 3. Wait for the callback's promise to settle before
+                      ;;    settling the main `target-promise`.
+                      (loom:then
+                       cb-promise
+                       ;; 3a. If the side-effect callback succeeds...
+                       (lambda (_)
+                         ;; ...settle our target promise with the
+                         ;; original promise's outcome.
+                         (if is-resolved
+                             (loom:resolve target-promise original-outcome)
+                           (loom:reject target-promise original-outcome)))
+                       ;; 3b. If the side-effect callback fails...
+                       (lambda (cb-reason)
+                         ;; ...reject our target promise with the new error.
+                         (loom:reject target-promise cb-reason))))
+                  ;; If `callback-fn` itself throws a synchronous error,
                   ;; that error immediately rejects the target promise.
-                  (error (loom:reject target-promise (loom:make-error :cause cb-err))))))
-      
+                  (error (loom:reject target-promise
+                                      (loom:make-error :type :callback-error
+                                                       :cause cb-err))))))
+
       ;; Attach the primary handlers to the original source promise.
       (loom-attach-callbacks
        source-promise
-       ;; ON-RESOLVED: when the source promise resolves with `value`.
-       (loom:callback
-        (lambda (_tp value)
-          (handle-callback value t))
-        :type :resolved
-        :source-promise-id source-id
-        :promise-id target-id)
-       ;; ON-REJECTED: when the source promise rejects with `reason`.
-       (loom:callback
-        (lambda (_tp reason)
-          (handle-callback reason nil))
-        :type :rejected
-        :source-promise-id source-id
-        :promise-id target-id)))
-    
+       (loom:callback (lambda (_tp value) (handle-callback value t))
+                      :type :resolved
+                      :source-promise-id source-id
+                      :promise-id target-id)
+       (loom:callback (lambda (_tp reason) (handle-callback reason nil))
+                      :type :rejected
+                      :source-promise-id source-id
+                      :promise-id target-id)))
     target-promise))
-    
+
 ;;;###autoload
 (defun loom:tap (promise callback-fn)
   "Attach a callback for side effects, without altering the promise chain.
-
 This is useful for inspecting a promise's value or error at a
-certain point in a chain without modifying it (e.g., for logging
-or debugging). The original outcome is always passed through.
+certain point in a chain without modifying it (e.g., for logging).
+The original outcome is always passed through.
 
 Arguments:
 - `PROMISE` (any): The promise or value to inspect.
@@ -317,33 +295,19 @@ Returns:
 - (loom-promise): A new promise that settles with the exact same
   outcome as the original `PROMISE`.
 
-Signals:
-- Does not signal errors. Any error raised within `CALLBACK-FN` is
-  ignored to ensure the main promise chain is not affected.
-
 Side Effects:
-- Schedules `CALLBACK-FN` for execution when `PROMISE` settles."
-  (let* ((source-promise (if (loom-promise-p promise)
-                             promise
-                           (loom:resolved! promise)))
-         (new-promise (loom:promise
-                       :name (format "tap-%S" (loom-promise-id source-promise))
-                       :parent-promise source-promise)))
-    (loom-attach-callbacks
-     source-promise
-     ;; on-resolved: run callback, then pass original value through.
-     (loom:callback
-      (lambda (_ value)
-        (condition-case nil (funcall callback-fn value nil) (error nil))
-        (loom:resolve new-promise value))
-      :type :resolved)
-     ;; on-rejected: run callback, then re-throw original error.
-     (loom:callback
-      (lambda (_ error)
-        (condition-case nil (funcall callback-fn nil error) (error nil))
-        (loom:reject new-promise error))
-      :type :rejected))
-    new-promise))
+- Schedules `CALLBACK-FN` for execution when `PROMISE` settles. Any
+  error raised within `CALLBACK-FN` is ignored."
+  (loom:then
+   promise
+   ;; on-resolved: run callback, then pass original value through.
+   (lambda (value)
+     (condition-case nil (funcall callback-fn value nil) (error nil))
+     value)
+   ;; on-rejected: run callback, then re-throw original error.
+   (lambda (err)
+     (condition-case nil (funcall callback-fn nil err) (error nil))
+     (signal (loom-error-type err) (list (loom:error-value err))))))
 
 (provide 'loom-primitives)
 ;;; loom-primitives.el ends here

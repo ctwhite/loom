@@ -13,36 +13,36 @@
 ;; ## Key Architectural Concepts
 ;;
 ;; - **Promise/A+ Compliance:** Implements a strict state machine (`:pending`,
-;;   `:resolved`, `:rejected`) where a promise can only be settled once. It
-;;   guarantees that all callbacks (`.then`, `.catch`, `.finally`) execute
-;;   asynchronously, preventing stack overflow and ensuring a consistent
-;;   execution order.
+;;   `:resolved`, `:rejected`) where a promise can only be settled once. It
+;;   guarante всех that all callbacks (`.then`, `.catch`, `.finally`) execute
+;;   asynchronously, preventing stack overflow and ensuring a consistent
+;;   execution order.
 ;;
 ;; - **Centralized State Management:** To eliminate race conditions, all state
-;;   transitions (settling a promise) for `:thread` and `:process` mode promises
-;;   are funneled through the main Emacs thread via the IPC mechanism. A
-;;   background thread's attempt to settle a promise dispatches a message to the
-;;   main thread, which then performs the actual state change. This makes the
-;;   main thread the single source of truth for a promise's lifecycle.
+;;   transitions (settling a promise) for `:thread` and `:process` mode promises
+;;   are funneled through the main Emacs thread via the IPC mechanism. A
+;;   background thread's attempt to settle a promise dispatches a message to the
+;;   main thread, which then performs the actual state change. This makes the
+;;   main thread the single source of truth for a promise's lifecycle.
 ;;
 ;; - **Cooperative `await`:** The `loom:await` macro provides a way to write
-;;   synchronous-looking code that consumes promises. Critically, it does **not**
-;;   perform a hard block. Instead, it enters a cooperative polling loop that
-;;   repeatedly runs the Loom scheduler and yields control, keeping the Emacs
-;;   UI responsive.
+;;   synchronous-looking code that consumes promises. Critically, it does **not**
+;;   perform a hard block. Instead, it enters a cooperative polling loop that
+;;   repeatedly runs the Loom scheduler and yields control, keeping the Emacs
+;;   UI responsive.
 ;;
 ;; - **Flexible Concurrency Modes:** Supports promises that encapsulate work
-;;   in different contexts:
-;;   - `:deferred`: For operations on the main Emacs thread's event loop.
-;;   - `:thread`: For tasks offloaded to a native Emacs Lisp thread.
-;;   - `:process`: For tasks managed in an external OS process.
+;;   in different contexts:
+;;   - `:deferred`: For operations on the main Emacs thread's event loop.
+;;   - `:thread`: For tasks offloaded to a native Emacs Lisp thread.
+;;   - `:process`: For tasks managed in an external OS process.
 ;;
 ;; - **Cancellation:** Integrates with `loom-cancel-token` to allow for the
-;;   propagation of cancellation requests through a chain of promises.
+;;   propagation of cancellation requests through a chain of promises.
 ;;
 ;; - **Unhandled Rejection Tracking:** The system can detect when a promise is
-;;   rejected but has no error handler attached, helping to identify silent
-;;   failures in asynchronous code.
+;;   rejected but has no error handler attached, helping to identify silent
+;;   failures in asynchronous code.
 
 ;;; Code:
 
@@ -56,7 +56,7 @@
 (require 'loom-registry)
 (require 'loom-errors)
 (require 'loom-callback)
-(require 'loom-thread-polling)
+(require 'loom-poll)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Forward Declarations
@@ -302,7 +302,7 @@ Returns: The original `PROMISE`."
     ;; filter.
     (when (and (eq (loom-promise-mode promise) :thread)
                (fboundp 'make-thread)
-               (not (equal (current-thread) (thread-main))))
+               (not (equal (current-thread) main-thread)))
       (let* ((id (loom-promise-id promise))
              (payload-data (if error `(:error ,error) `(:value ,result))))
         (loom-log :debug id
@@ -317,28 +317,23 @@ Returns: The original `PROMISE`."
     (let (settled-now callbacks-to-run (id (loom-promise-id promise)))
       (loom-log :debug id "Attempting to settle promise on main thread.")
       (loom:with-mutex! (loom-promise-lock promise)
-        ;; Spec 2.1: A promise must be in one of three states.
-        ;; This `when` block ensures it only transitions from :pending once.
+        ;; This `when` block ensures the promise only transitions from :pending once.
         (when (eq (loom-promise-state promise) :pending)
           (setq settled-now t)
           (let ((new-state (if error :rejected :resolved)))
-            ;; Spec 2.1.2 & 2.1.3: A promise, once settled, must not change state.
-            ;; This is enforced by the surrounding `when (eq ... :pending)` check.
             (loom-log :info id "State transition: :pending -> %S" new-state)
             (setf (loom-promise-result promise) result
                   (loom-promise-error promise) error
                   (loom-promise-state promise) new-state
                   (loom-promise-cancelled-p promise) is-cancellation))
-          ;; Spec 2.2.6: `then` may be called multiple times. We atomically
-          ;; retrieve all queued callbacks and clear the list.
+          ;; Atomically retrieve all queued callbacks and clear the list.
           (setq callbacks-to-run (nreverse (loom-promise-callbacks promise)))
           (setf (loom-promise-callbacks promise) nil)))
 
       ;; If we were the ones to settle the promise *just now*...
       (when settled-now
         (loom-log :debug id "Promise successfully settled. Dispatching callbacks.")
-        ;; Spec 2.2.4: Handlers must run asynchronously. This function
-        ;; schedules them on the appropriate queue (microtask/macrotask).
+        ;; Handlers must run asynchronously. This schedules them.
         (loom--schedule-or-dispatch-callbacks
          promise callbacks-to-run is-cancellation)
         (loom-registry-update-promise-state promise)))
@@ -502,7 +497,8 @@ Signals: `error` if the source promise for the callback is missing."
          (source-promise (loom-registry-get-promise-by-id source-promise-id))
          (target-promise (loom-registry-get-promise-by-id target-promise-id)))
     (unless source-promise
-      (error "Loom internal error: Source promise %S not found in registry during callback execution"
+      (error "Loom internal error: Source promise %S not found in 
+              registry during callback execution"
              source-promise-id))
 
     (when target-promise
@@ -595,7 +591,11 @@ Arguments:
 - `PROMISE` (loom-promise): The new promise being constructed.
 - `EXECUTOR` (function): The user-provided executor `(lambda (resolve reject) ...)`
 
-Returns: `nil`."
+Returns: `nil`.
+
+Spec References:
+- [Promise/A+ 2.1]: The `executor` is passed `resolve` and `reject` functions.
+- [Promise/A+ 2.1.1.4]: `executor` may throw an error."
   (let ((id (loom-promise-id promise)))
     (loom-log :debug id "Executing promise executor function.")
     (cl-letf (((symbol-value 'loom-current-async-stack)
@@ -620,12 +620,15 @@ Returns: `nil`."
                              parent-promise cancel-token tags)
   "Creates a new, pending `loom-promise`. This is the primary constructor.
 If an `:executor` function `(lambda (resolve reject) ...)` is provided,
-it is called immediately with two functions that control the promise's fate.
+its execution is handled based on the promise `:mode`.
+
+- `:deferred`: The executor runs immediately on the current thread.
+- `:thread`: The executor is run in a new background thread.
+- `:process`: (Not implemented in this function, requires a different setup).
 
 Arguments:
 - `:EXECUTOR` (function, optional): The function that starts the async work.
-- `:MODE` (symbol): Concurrency mode: `:deferred` (main thread),
-  `:thread` (background thread), or `:process` (external process).
+- `:MODE` (symbol): Concurrency mode: `:deferred` or `:thread`.
 - `:NAME` (string, optional): A descriptive name for debugging and logging.
 - `:PARENT-PROMISE` (loom-promise, internal): Used by `.then` to link promises.
 - `:CANCEL-TOKEN` (loom-cancel-token, optional): A token for propagating
@@ -652,7 +655,19 @@ Returns: A new `loom-promise` in the `:pending` state."
       (loom-cancel-token-add-callback
        cancel-token (lambda (reason) (loom:cancel promise reason))))
 
-    (when executor (loom--promise-execute-executor promise executor))
+    (when executor
+      (pcase mode
+        (:deferred
+         ;; For deferred mode, execute immediately on the current thread.
+         (loom--promise-execute-executor promise executor))
+        (:thread
+         (unless (fboundp 'make-thread)
+           (error "Emacs does not support threads; cannot use :thread mode"))
+         ;; For thread mode, run the executor helper in a new thread.
+         (make-thread (lambda () (loom--promise-execute-executor promise executor))
+                      (format "loom-promise-%S" promise-id)))
+        (_
+         (error "Unsupported promise mode for executor: %S" mode))))
     promise))
 
 ;;;###autoload
@@ -674,8 +689,7 @@ Returns: The original `PROMISE`."
   (let ((id (loom-promise-id promise)))
     (loom-log :debug id "Resolve called with value of type %S." (type-of value))
 
-    ;; Spec 2.3.1: A promise cannot be resolved with itself. This would
-    ;; create an unresolvable cycle.
+    ;; A promise cannot be resolved with itself.
     (if (eq promise value)
         (loom:reject promise (loom:make-error :type :type-error
                                               :message "Promise resolution cycle detected."))
@@ -684,7 +698,7 @@ Returns: The original `PROMISE`."
              (if (loom-promise-p value) value
                (run-hook-with-args-until-success
                 'loom-normalize-awaitable-hook value))))
-        ;; Spec 2.3.2: If the value is a promise (a "thenable"), adopt its state.
+        ;; If the value is a promise (a "thenable"), adopt its state.
         (if (loom-promise-p normalized-value)
             (let ((outer-promise promise))
               (loom-log :info id "Chaining to inner promise %S."
@@ -703,8 +717,7 @@ Returns: The original `PROMISE`."
                               :promise-id id
                               :source-promise-id
                               (loom-promise-id normalized-value))))
-          ;; Spec 2.3.4: If the value is a normal value, fulfill the promise
-          ;; with it.
+          ;; If the value is a normal value, fulfill the promise with it.
           (loom--settle-promise promise value nil nil)))))
   promise)
 

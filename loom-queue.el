@@ -15,7 +15,6 @@
 
 (require 'cl-lib)
 
-(require 'loom-log)
 (require 'loom-errors)
 (require 'loom-lock)
 
@@ -225,6 +224,59 @@ Returns:
         (push (loom--queue-dequeue-internal queue) items))
       (nreverse items))))
 
+;;;###autoload
+(cl-defun loom:queue-remove-if (queue predicate)
+  "Remove all items from `QUEUE` for which `PREDICATE` returns non-nil.
+The `PREDICATE` function is called with one argument: the item in the queue.
+Time complexity: O(n) due to the linear traversal. This operation is
+thread-safe.
+
+Arguments:
+- `QUEUE` (loom-queue): The queue instance.
+- `PREDICATE` (function): A function that takes one argument (an item)
+  and returns non-nil if the item should be removed.
+
+Returns:
+- (integer): The number of items removed from the queue."
+  (loom--validate-queue queue 'loom:queue-remove-if)
+  (loom:with-mutex! (loom-queue-lock queue)
+    (let* ((head (loom-queue-head queue))
+           (removed-count 0)
+           (prev nil)
+           (curr head))
+
+      ;; Handle removal from the head of the queue
+      (while (and curr (funcall predicate (loom-queue-node-data curr)))
+        (setf (loom-queue-head queue) (loom-queue-node-next curr))
+        (cl-decf (loom-queue-count queue))
+        (cl-incf removed-count)
+        (setq curr (loom-queue-head queue)))
+
+      ;; After potentially removing head elements, update tail if queue is now empty
+      (when (zerop (loom-queue-count queue))
+        (setf (loom-queue-tail queue) nil))
+
+      ;; Now, iterate through the rest of the list
+      (setq prev curr) ; 'curr' is now the new head or nil
+      (when prev
+        (setq curr (loom-queue-node-next prev))
+        (while curr
+          (if (funcall predicate (loom-queue-node-data curr))
+              (progn
+                ;; Skip the current node by linking previous to current's next
+                (setf (loom-queue-node-next prev) (loom-queue-node-next curr))
+                ;; If we removed the tail, update the tail pointer.
+                ;; The new tail is 'prev' because 'curr' was removed.
+                (when (eq curr (loom-queue-tail queue))
+                  (setf (loom-queue-tail queue) prev))
+                (cl-decf (loom-queue-count queue))
+                (cl-incf removed-count)
+                ;; Don't advance 'prev', as the new 'curr' is now its next
+                (setq curr (loom-queue-node-next prev)))
+            (setq prev curr
+                  curr (loom-queue-node-next curr)))))
+    removed-count)))
+    
 ;;;###autoload
 (defun loom:queue-length (queue)
   "Return the number of items in `QUEUE`.

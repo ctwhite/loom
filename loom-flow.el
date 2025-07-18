@@ -1,26 +1,21 @@
 ;;; loom-flow.el --- High-Level Asynchronous Control Flow -*- lexical-binding: t; -*-
-;;
+
 ;;; Commentary:
 ;;
 ;; This library provides a suite of high-level asynchronous primitives that
 ;; build upon the foundational `loom-promise` system. It provides
 ;; asynchronous, promise-aware versions of common Emacs Lisp control-flow
-;; constructs.
+;; constructs, allowing developers to write complex asynchronous logic in a
+;; style that is familiar and readable.
 ;;
 ;; Core Features:
-;; - `loom:let` & `loom:let*`: Ergonomic, promise-aware versions of `let`
-;;   that handle parallel and sequential resolution of asynchronous bindings.
-;; - `loom:if!`: Asynchronous conditional evaluation.
-;; - `loom:when!` & `loom:unless!`: Asynchronous conditional execution.
-;; - `loom:cond!`: Asynchronous multi-branch conditional.
-;; - `loom:loop!`: Asynchronous looping construct.
-;; - `loom:try!`, `loom:unwind-protect!`: Structured error and cleanup handling
-;;   for asynchronous operations.
-;; - `loom:with-timeout!`, `loom:with-retries!`: Robust wrappers for adding
-;;   common resilience patterns to any asynchronous operation.
-;; - `loom:while!`: Asynchronous while loop.
-;; - `loom:dolist!`: Asynchronous list iteration.
-;; - `loom:dotimes!`: Asynchronous numeric iteration.
+;; - `loom:let` & `loom:let*`: Ergonomic, promise-aware versions of `let`.
+;; - `loom:progn!`: A simple way to execute promise-returning forms in sequence.
+;; - `loom:if!`, `loom:when!`, `loom:unless!`, `loom:cond!`: Async conditionals.
+;; - `loom:loop!`, `loom:while!`, `loom:dolist!`, `loom:dotimes!`: Async loops.
+;; - `loom:unwind-protect!`: Structured cleanup handling.
+;; - `loom:with-timeout!`: A wrapper to enforce a time limit on an operation.
+;; - `loom:with-concurrency-limit!`: Control over parallel execution.
 
 ;;; Code:
 
@@ -30,102 +25,127 @@
 (require 'loom-promise)
 (require 'loom-primitives)
 (require 'loom-combinators)
+(require 'loom-semaphore)
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Errors Definitions
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Error Definitions
 
 (define-error 'loom-flow-timeout-error
-  "Operation timed out." 
-  'loom-error)
+  "An operation in an async flow construct timed out."
+  'loom-timeout-error)
 
 (define-error 'loom-flow-break-error
-  "Break from async loop."
+  "A special error used to break from a `loom:loop!`."
   'loom-error)
 
 (define-error 'loom-flow-continue-error
-  "Continue in async loop."
+  "A special error used to continue a `loom:loop!`."
   'loom-error)
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Asynchronous Bindings & Control Flow
 
 ;;;###autoload
 (defmacro loom:let (bindings &rest body)
   "Execute `BODY` with `BINDINGS` resolved from promises in parallel.
-All promises in `BINDINGS` are initiated concurrently. The `BODY` is
-evaluated only after all of them have resolved successfully.
-
-`BINDINGS` is a list of `(VAR PROMISE-FORM)` pairs.
+All promise-forms in `BINDINGS` are initiated concurrently using
+`loom:all`. The `BODY` is evaluated only after all of them have
+resolved successfully. This is the asynchronous equivalent of a
+parallel `let`.
 
 Arguments:
-- `BINDINGS` (list): A list of `(VAR VAL-FORM)` bindings.
+- `BINDINGS` (list): A list of `(VAR PROMISE-FORM)` pairs. `VAR` is
+  the symbol to bind, and `PROMISE-FORM` is a form that evaluates
+  to a `loom-promise`.
 - `BODY` (forms): The forms to execute with the resolved bindings.
 
 Returns:
-- (loom-promise): A promise resolving to the result of `BODY`."
+A `loom-promise` that resolves to the result of the last form in `BODY`."
   (declare (indent 1) (debug ((&rest (symbolp form)) body)))
   (if (null bindings)
       `(loom:resolved! (progn ,@body))
     (let ((vars (mapcar #'car bindings))
           (forms (mapcar #'cadr bindings)))
+      ;; Use `loom:all` to wait for all binding forms to resolve in parallel.
       `(loom:then (loom:all (list ,@forms))
                   (lambda (results)
+                    ;; Bind the results to the specified variables.
                     (cl-destructuring-bind ,vars results
                       ,@body))))))
 
 ;;;###autoload
 (defmacro loom:let* (bindings &rest body)
   "Execute `BODY` with `BINDINGS` resolved sequentially.
-Each promise in `BINDINGS` is awaited before the next begins, and its result
-is bound and available for use in subsequent binding forms.
-
-`BINDINGS` is a list of `(VAR PROMISE-FORM)` pairs.
+Each promise in `BINDINGS` is awaited before the next begins, and its
+result is bound and available for use in subsequent binding forms.
+This is the asynchronous equivalent of a sequential `let*`.
 
 Arguments:
-- `BINDINGS` (list): A list of `(VAR VAL-FORM)` bindings.
+- `BINDINGS` (list): A list of `(VAR PROMISE-FORM)` pairs.
 - `BODY` (forms): The forms to execute with the resolved bindings.
 
 Returns:
-- (loom-promise): A promise resolving to the result of `BODY`."
+A `loom-promise` that resolves to the result of the last form in `BODY`."
   (declare (indent 1) (debug ((&rest (symbolp form)) body)))
   (if (null bindings)
+      ;; Base case: no more bindings, execute the body.
       `(loom:resolved! (progn ,@body))
     (let* ((binding (car bindings))
            (var (car binding))
            (form (cadr binding)))
+      ;; Recursively build a chain of `.then` calls.
       `(loom:then ,form
                   (lambda (,var)
                     (loom:let* ,(cdr bindings) ,@body))))))
 
 ;;;###autoload
+(defmacro loom:progn! (&rest forms)
+  "Execute a sequence of promise-returning FORMS sequentially.
+This is the asynchronous equivalent of `progn`. It evaluates each
+form in order, waiting for the promise it returns to resolve before
+proceeding to the next.
+
+Arguments:
+- `FORMS` (list): A list of forms, each of which should evaluate to a
+  `loom-promise`.
+
+Returns:
+A `loom-promise` that resolves with the value of the last form in `FORMS`."
+  (declare (debug t))
+  (if (null forms)
+      `(loom:resolved! nil)
+    `(loom:let* ,(--map `(,(gensym "_") ,it) forms)
+       ,(car (last forms)))))
+
+;;;###autoload
 (defmacro loom:unwind-protect! (body-form &rest cleanup-forms)
   "Execute `BODY-FORM` and guarantee `CLEANUP-FORMS` run afterward.
-This is the asynchronous equivalent of `unwind-protect`.
+This is the asynchronous equivalent of `unwind-protect`, implemented
+using `loom:finally`. It ensures that the cleanup logic is executed
+regardless of whether the main body's promise resolves or rejects.
 
 Arguments:
 - `BODY-FORM` (form): A form that evaluates to a promise.
-- `CLEANUP-FORMS` (forms): The forms to execute upon settlement.
+- `CLEANUP-FORMS` (forms): The synchronous forms to execute upon settlement.
 
 Returns:
-- `(loom-promise)`: A new promise that settles with the same outcome as
-  `BODY-FORM`'s promise, but only after `CLEANUP-FORMS` have run."
+A new `loom-promise` that settles with the same outcome as
+`BODY-FORM`'s promise, but only after `CLEANUP-FORMS` have run."
   (declare (indent 1) (debug t))
   `(loom:finally ,body-form (lambda () ,@cleanup-forms)))
 
 ;;;###autoload
 (defmacro loom:if! (condition-promise then-form &optional else-form)
   "Run `THEN-FORM` or `ELSE-FORM` based on the result of `CONDITION-PROMISE`.
-This is the asynchronous equivalent of `if`. It waits for `CONDITION-PROMISE`
-to resolve, and if the result is non-nil, evaluates `THEN-FORM`;
-otherwise it evaluates `ELSE-FORM`.
+This is the asynchronous equivalent of `if`.
 
 Arguments:
-- `CONDITION-PROMISE` (form): A form evaluating to a promise for a boolean.
-- `THEN-FORM` (form): The form to execute if the condition is true.
-- `ELSE-FORM` (form, optional): The form to execute if the condition is false.
+- `CONDITION-PROMISE` (form): A form evaluating to a promise.
+- `THEN-FORM` (form): The form to execute if the condition resolves to a non-nil value.
+- `ELSE-FORM` (form, optional): The form to execute if it resolves to nil.
 
 Returns:
-- `(loom-promise)`: A promise for the result of the executed form."
+A `loom-promise` that resolves with the result of the executed form."
   (declare (indent 1) (debug t))
   `(loom:then ,condition-promise
               (lambda (result)
@@ -137,15 +157,16 @@ Returns:
 This is the asynchronous equivalent of `when`.
 
 Arguments:
-- `CONDITION-PROMISE` (form): A form evaluating to a promise for a boolean.
+- `CONDITION-PROMISE` (form): A form evaluating to a promise.
 - `BODY` (forms): The forms to execute if the condition is true.
 
 Returns:
-- `(loom-promise)`: A promise for the result of `BODY` or nil."
+A `loom-promise` that resolves with the result of `BODY`, or `nil` if
+the condition was false."
   (declare (indent 1) (debug t))
   `(loom:if! ,condition-promise
              (progn ,@body)
-             nil))
+             (loom:resolved! nil)))
 
 ;;;###autoload
 (defmacro loom:unless! (condition-promise &rest body)
@@ -153,33 +174,38 @@ Returns:
 This is the asynchronous equivalent of `unless`.
 
 Arguments:
-- `CONDITION-PROMISE` (form): A form evaluating to a promise for a boolean.
+- `CONDITION-PROMISE` (form): A form evaluating to a promise.
 - `BODY` (forms): The forms to execute if the condition is false.
 
 Returns:
-- `(loom-promise)`: A promise for the result of `BODY` or nil."
+A `loom-promise` that resolves with the result of `BODY`, or `nil` if
+the condition was true."
   (declare (indent 1) (debug t))
   `(loom:if! ,condition-promise
-             nil
+             (loom:resolved! nil)
              (progn ,@body)))
 
 ;;;###autoload
 (defmacro loom:cond! (&rest clauses)
-  "Asynchronous multi-branch conditional.
-Each clause is `(CONDITION-PROMISE . BODY)`. The first clause whose
-condition resolves to non-nil has its body executed.
+  "Asynchronous multi-branch conditional, like `cond`.
+Each clause is `(CONDITION-PROMISE . BODY)`. The macro evaluates each
+`CONDITION-PROMISE` in sequence. The `BODY` of the first clause whose
+condition resolves to a non-nil value is executed, and its result becomes
+the result of the entire `loom:cond!` expression.
 
 Arguments:
 - `CLAUSES` (list): A list of `(CONDITION-PROMISE . BODY)` clauses.
 
 Returns:
-- `(loom-promise)`: A promise for the result of the executed clause's body."
+A `loom-promise` that resolves with the result of the executed clause's body."
   (declare (indent 0) (debug (&rest (form body))))
   (if (null clauses)
       `(loom:resolved! nil)
     (let ((clause (car clauses)))
       (if (eq (car clause) t)
-          `(loom:resolved! (progn ,@(cdr clause)))
+          ;; If the condition is `t`, it's the final `else` case.
+          `(progn ,@(cdr clause))
+        ;; Otherwise, create a nested `loom:if!` chain.
         `(loom:if! ,(car clause)
                    (progn ,@(cdr clause))
                    (loom:cond! ,@(cdr clauses)))))))
@@ -187,38 +213,43 @@ Returns:
 ;;;###autoload
 (defmacro loom:while! (condition-promise &rest body)
   "Execute `BODY` repeatedly while `CONDITION-PROMISE` resolves to non-nil.
-This is the asynchronous equivalent of `while`.
+This is the asynchronous equivalent of `while`. The condition is re-evaluated
+before each iteration.
 
 Arguments:
-- `CONDITION-PROMISE` (form): A form evaluating to a promise for a boolean.
+- `CONDITION-PROMISE` (form): A form evaluating to a promise.
 - `BODY` (forms): The forms to execute in each iteration.
 
 Returns:
-- `(loom-promise)`: A promise that resolves to nil when the loop completes."
+A `loom-promise` that resolves to `nil` when the loop completes."
   (declare (indent 1) (debug t))
   (let ((loop-fn (gensym "loop-fn-")))
     `(let ((,loop-fn nil))
        (setq ,loop-fn
              (lambda ()
                (loom:then ,condition-promise
-                         (lambda (result)
-                           (if result
-                               (loom:then (progn ,@body)
-                                         (lambda (_) (funcall ,loop-fn)))
-                             (loom:resolved! nil))))))
+                          (lambda (result)
+                            (if result
+                                ;; If condition is true, run body then recurse.
+                                (loom:then (progn ,@body)
+                                           (lambda (_) (funcall ,loop-fn)))
+                              ;; If condition is false, loop is done.
+                              (loom:resolved! nil))))))
        (funcall ,loop-fn))))
 
 ;;;###autoload
 (defmacro loom:dolist! (spec &rest body)
-  "Asynchronously iterate over a list.
-`SPEC` is `(VAR LIST-PROMISE &optional RESULT-FORM)`.
+  "Asynchronously iterate over a list, like `dolist`.
+The `SPEC` is `(VAR LIST-PROMISE &optional RESULT-FORM)`. The macro
+first resolves `LIST-PROMISE` to get the list, then iterates over
+each element, executing `BODY` for each one.
 
 Arguments:
 - `SPEC` (list): Iteration specification.
 - `BODY` (forms): The forms to execute for each element.
 
 Returns:
-- `(loom-promise)`: A promise for the result of `RESULT-FORM` or nil."
+A `loom-promise` that resolves with the result of `RESULT-FORM`, or `nil`."
   (declare (indent 1) (debug ((symbolp form &optional form) body)))
   (let ((var (car spec))
         (list-form (cadr spec))
@@ -233,22 +264,25 @@ Returns:
                             (if remaining
                                 (let ((,var (car remaining)))
                                   (loom:then (progn ,@body)
-                                            (lambda (_)
-                                              (funcall ,loop-fn (cdr remaining)))))
+                                             (lambda (_)
+                                               (funcall ,loop-fn
+                                                        (cdr remaining)))))
                               (loom:resolved! ,result-form))))
                     (funcall ,loop-fn ,list-var))))))
 
 ;;;###autoload
 (defmacro loom:dotimes! (spec &rest body)
-  "Asynchronously iterate a specified number of times.
-`SPEC` is `(VAR COUNT-PROMISE &optional RESULT-FORM)`.
+  "Asynchronously iterate a specified number of times, like `dotimes`.
+The `SPEC` is `(VAR COUNT-PROMISE &optional RESULT-FORM)`. The macro
+first resolves `COUNT-PROMISE` to get the count, then iterates from
+0 up to (but not including) the count.
 
 Arguments:
 - `SPEC` (list): Iteration specification.
 - `BODY` (forms): The forms to execute for each iteration.
 
 Returns:
-- `(loom-promise)`: A promise for the result of `RESULT-FORM` or nil."
+A `loom-promise` that resolves with the result of `RESULT-FORM`, or `nil`."
   (declare (indent 1) (debug ((symbolp form &optional form) body)))
   (let ((var (car spec))
         (count-form (cadr spec))
@@ -262,80 +296,85 @@ Returns:
                           (lambda (,var)
                             (if (< ,var ,count-var)
                                 (loom:then (progn ,@body)
-                                          (lambda (_)
-                                            (funcall ,loop-fn (1+ ,var))))
+                                           (lambda (_)
+                                             (funcall ,loop-fn (1+ ,var))))
                               (loom:resolved! ,result-form))))
                     (funcall ,loop-fn 0))))))
 
 ;;;###autoload
 (defmacro loom:loop! (&rest body)
   "Create an infinite asynchronous loop.
-The loop can be exited using `loom:break!` or `loom:continue!`.
+The loop can be exited by calling `loom:break!` from within the body.
+`loom:continue!` can be used to skip to the next iteration. This is
+implemented by catching special error signals.
 
 Arguments:
 - `BODY` (forms): The forms to execute in each iteration.
 
 Returns:
-- `(loom-promise)`: A promise that resolves when the loop is broken."
-  (declare (indent 0) (debug t))
-  (let ((loop-fn (gensym "loop-fn-"))
-        (result-var (gensym "result-")))
-    `(let ((,loop-fn nil)
-           (,result-var nil))
+A `loom-promise` that resolves with the value passed to `loom:break!`."
+  (declare (indent 1) (debug t))
+  (let ((loop-fn (gensym "loop-fn-")))
+    `(let ((,loop-fn nil))
        (setq ,loop-fn
              (lambda ()
                (loom:catch
-                (progn ,@body)
-                (lambda (err)
-                  (cond
-                   ((eq (loom:error-type err) 'loom-flow-break-error)
-                    (loom:resolved! (loom:error-data err)))
-                   ((eq (loom:error-type err) 'loom-flow-continue-error)
-                    (funcall ,loop-fn))
-                   (t (loom:rejected! err)))))))
+                (loom:then (progn ,@body)
+                           (lambda (_) (funcall ,loop-fn)))
+                ;; Special handler for break/continue signals.
+                'loom-flow-break-error
+                (lambda (err) (loom:resolved! (loom:error-data err)))
+                'loom-flow-continue-error
+                (lambda (_) (funcall ,loop-fn))
+                ;; Any other error is propagated.
+                (lambda (err) (loom:rejected! err)))))
        (funcall ,loop-fn))))
 
 ;;;###autoload
 (defmacro loom:break! (&optional value)
-  "Break from an asynchronous loop with optional return value.
+  "Break from a `loom:loop!` with an optional return `VALUE`.
+This macro works by rejecting a promise with a special, internal
+error type that is caught by `loom:loop!`.
 
 Arguments:
 - `VALUE` (form, optional): The value to return from the loop.
 
 Returns:
-- Never returns; signals a break error."
-  `(loom:rejected! (loom:make-error
-                    :type 'loom-flow-break-error
-                    :data ,value)))
+A `loom-promise` that rejects with a special `loom-flow-break-error`."
+  `(loom:rejected! (loom:make-error :type 'loom-flow-break-error
+                                    :data ,value)))
 
 ;;;###autoload
 (defmacro loom:continue! ()
-  "Continue to the next iteration of an asynchronous loop.
+  "Continue to the next iteration of a `loom:loop!`.
+This macro works by rejecting a promise with a special, internal
+error type that is caught by `loom:loop!`.
 
 Returns:
-- Never returns; signals a continue error."
-  `(loom:rejected! (loom:make-error
-                    :type 'loom-flow-continue-error)))
+A `loom-promise` that rejects with a special `loom-flow-continue-error`."
+  `(loom:rejected! (loom:make-error :type 'loom-flow-continue-error)))
 
 ;;;###autoload
 (defmacro loom:with-timeout! (timeout-ms body-form &key cancel-token)
-  "Run `BODY-FORM`, rejecting with a timeout error if it takes too long.
-Races the promise from `BODY-FORM` against a timer. The returned promise
-can be cancelled via the optional `:cancel-token`.
+  "Run `BODY-FORM`, rejecting if it takes too long.
+This macro uses `loom:race` to run the `BODY-FORM`'s promise in
+parallel with a delay promise. Whichever settles first determines
+the outcome.
 
 Arguments:
 - `TIMEOUT-MS` (integer): The timeout in milliseconds.
 - `BODY-FORM` (form): A form returning a promise.
-- `:CANCEL-TOKEN` (loom-cancel-token, optional): A token to cancel the operation.
+- `:CANCEL-TOKEN` (loom-cancel-token, optional): A token to cancel the
+  operation.
 
 Returns:
-- (loom-promise): A promise that settles with `BODY-FORM`'s result or
-  rejects with a `loom-flow-timeout-error` or `loom-cancel-error`."
+A `loom-promise` that settles with `BODY-FORM`'s result or
+rejects with a `loom-flow-timeout-error`."
   (declare (indent 1) (debug t))
-  (let ((timeout-secs (/ (float timeout-ms) 1000.0)))
-    `(loom:race!
+  `(let ((timeout-secs (/ (float ,timeout-ms) 1000.0)))
+     (loom:race
       ,body-form
-      (loom:then (loom:delay ,timeout-secs :cancel-token ,cancel-token)
+      (loom:then (loom:delay timeout-secs :cancel-token ,cancel-token)
                  (lambda (_)
                    (loom:rejected!
                     (loom:make-error
@@ -344,145 +383,33 @@ Returns:
                                       ,timeout-ms))))))))
 
 ;;;###autoload
-(defmacro loom:with-retries! (options body-form)
-  "Retry `BODY-FORM` upon failure.
-`OPTIONS` is a plist that can contain `:retries`, `:delay`, and `:pred`.
-See `loom:retry` for details.
-
-Arguments:
-- `OPTIONS` (plist): A plist of retry options.
-- `BODY-FORM` (form): A form returning a promise.
-
-Returns:
-- (loom-promise): A promise that resolves with the first successful
-  result, or rejects with the last error if all retries fail."
-  (declare (indent 1) (debug t))
-  `(apply #'loom:retry (lambda () ,body-form) ,options))
-
-;;;###autoload
-(defmacro loom:with-deadline! (deadline-time body-form &key cancel-token)
-  "Run `BODY-FORM`, rejecting if it doesn't complete by `DEADLINE-TIME`.
-Unlike `loom:with-timeout!`, this uses an absolute deadline rather than
-a relative timeout.
-
-Arguments:
-- `DEADLINE-TIME` (float): The absolute time deadline (seconds since epoch).
-- `BODY-FORM` (form): A form returning a promise.
-- `:CANCEL-TOKEN` (loom-cancel-token, optional): A token to cancel the operation.
-
-Returns:
-- (loom-promise): A promise that settles with `BODY-FORM`'s result or
-  rejects with a `loom-flow-timeout-error`."
-  (declare (indent 1) (debug t))
-  (let ((remaining-time `(max 0 (- ,deadline-time (float-time)))))
-    `(loom:with-timeout! (* 1000 ,remaining-time) ,body-form
-                         :cancel-token ,cancel-token)))
-
-;;;###autoload
-(defmacro loom:with-concurrency-limit! (limit body-forms)
+(defmacro loom:with-concurrency-limit! (limit &rest body-forms)
   "Execute `BODY-FORMS` with a maximum concurrency limit.
-Only `LIMIT` forms will be executed concurrently at any time.
+Only `LIMIT` forms will be executed concurrently at any time. This is
+implemented using a semaphore to control access.
 
 Arguments:
 - `LIMIT` (integer): The maximum number of concurrent operations.
-- `BODY-FORMS` (list): A list of forms that return promises.
+- `BODY-FORMS` (forms): Forms that return promises.
 
 Returns:
-- (loom-promise): A promise that resolves to a list of all results."
+A `loom-promise` that resolves to a list of all results."
   (declare (indent 1) (debug t))
-  (let ((forms-var (gensym "forms-"))
-        (limit-var (gensym "limit-"))
-        (results-var (gensym "results-"))
-        (running-var (gensym "running-"))
-        (process-fn (gensym "process-fn-")))
-    `(let ((,forms-var ,body-forms)
-           (,limit-var ,limit)
-           (,results-var (make-vector (length ,body-forms) nil))
-           (,running-var 0)
-           (,process-fn nil))
-       (setq ,process-fn
-             (lambda (index)
-               (if (>= index (length ,forms-var))
-                   (loom:resolved! (append ,results-var nil))
-                 (if (< ,running-var ,limit-var)
-                     (progn
-                       (setq ,running-var (1+ ,running-var))
-                       (loom:then (nth index ,forms-var)
-                                 (lambda (result)
-                                   (aset ,results-var index result)
-                                   (setq ,running-var (1- ,running-var))
-                                   (funcall ,process-fn (1+ index)))))
-                   (loom:then (loom:delay 0.001)
-                             (lambda (_) (funcall ,process-fn index)))))))
-       (funcall ,process-fn 0))))
-
-;;;###autoload
-(defmacro loom:try! (body-form &rest clauses)
-  "Run `BODY-FORM` with optional `:catch` and `:finally` handlers.
-This is a more structured way to combine `loom:catch` and `loom:finally`.
-
-Clauses:
-- `(:catch (ERR) &rest BODY)`: Handler if `BODY-FORM` rejects.
-- `(:catch TYPE (ERR) &rest BODY)`: Handler for specific error types.
-- `(:finally &rest BODY)`: Handler that runs after `BODY-FORM` settles.
-
-Returns:
-- (loom-promise): The final promise from the chain."
-  (declare (indent 1) (debug t))
-  (let ((catch-clauses (cl-remove-if-not (lambda (c) (eq (car c) :catch)) clauses))
-        (finally-clause (cl-find :finally clauses :key #'car))
-        (p (gensym "promise-")))
-    `(let ((,p (if (loom-promise-p ,body-form)
-                   ,body-form (loom:resolved! ,body-form))))
-       ,@(when finally-clause
-           `((setq ,p (loom:finally ,p (lambda () ,@(cdr finally-clause))))))
-       ,@(when catch-clauses
-           `((setq ,p (loom:catch ,p
-                        (lambda (err)
-                          (cond
-                          ,@(mapcar (lambda (clause)
-                                      (let ((spec (cadr clause)))
-                                        (if (symbolp spec)
-                                            ;; Simple catch: (:catch (err) ...)
-                                            `(t (let ((,spec err)) ,@(cddr clause)))
-                                          ;; Typed catch: (:catch type (err) ...)
-                                          (let ((type (car spec))
-                                                (var (cadr spec)))
-                                            `((eq (loom:error-type err) ',type)
-                                              (let ((,var err)) ,@(cddr clause)))))))
-                                    catch-clauses)
-                          (t (loom:rejected! err))))))))
-       ,p)))
-
-;;;###autoload
-(defmacro loom:switch! (value-promise &rest cases)
-  "Asynchronous switch statement.
-Each case is `(VALUE-OR-PRED . BODY)` or `(:default . BODY)`.
-
-Arguments:
-- `VALUE-PROMISE` (form): A form evaluating to a promise for the switch value.
-- `CASES` (list): A list of switch cases.
-
-Returns:
-- `(loom-promise)`: A promise for the result of the matching case's body."
-  (declare (indent 1) (debug t))
-  (let ((value-var (gensym "value-"))
-        (default-case (cl-find :default cases :key #'car)))
-    `(loom:then ,value-promise
-                (lambda (,value-var)
-                  (cond
-                   ,@(mapcar (lambda (case)
-                               (let ((test (car case))
-                                     (body (cdr case)))
-                                 (cond
-                                  ((eq test :default) nil) ; Skip default case
-                                  ((functionp test)
-                                   `((funcall ,test ,value-var) ,@body))
-                                  (t `((equal ,value-var ,test) ,@body)))))
-                             (cl-remove :default cases :key #'car))
-                   ,@(when default-case
-                       `((t ,@(cdr default-case))))
-                   (t nil))))))
+  (let ((sem (gensym "semaphore-")))
+    ;; Create a semaphore with the specified limit.
+    `(let ((,sem (loom:semaphore ,limit)))
+       ;; Use `loom:all` to wait for all operations to complete.
+       (loom:all
+        (list
+         ,@(mapcar (lambda (form)
+                     ;; Wrap each form in a lambda that first acquires a
+                     ;; permit from the semaphore, then runs the form, and
+                     ;; finally ensures the permit is released.
+                     `(loom:then (loom:semaphore-acquire ,sem)
+                                 (lambda (_)
+                                   (loom:finally (lambda () ,form)
+                                                 (lambda () (loom:semaphore-release ,sem))))))
+                   body-forms))))))
 
 (provide 'loom-flow)
 ;;; loom-flow.el ends here

@@ -1,5 +1,5 @@
 ;;; loom-priority-queue.el --- Thread-Safe Priority Queue -*- lexical-binding: t; -*-
-;;
+
 ;;; Commentary:
 ;;
 ;; This file provides a thread-safe priority queue implementation based on a
@@ -120,7 +120,7 @@ Returns: The highest-priority item, or signals an error if empty."
            (top (aref heap 0))
            (new-len (1- (loom-priority-queue-len queue))))
       (aset heap 0 (aref heap new-len))
-      (aset heap new-len nil)
+      (aset heap new-len nil) ; Clear the last element's old position
       (setf (loom-priority-queue-len queue) new-len)
       (when (> new-len 0)
         (loom--priority-queue-heapify-down queue 0))
@@ -291,17 +291,35 @@ Returns:
           (cl-decf (loom-priority-queue-len queue))
           ;; If the swapped element was not the one we removed, we need to
           ;; restore the heap property from its new position.
-          (when (< idx (1- len))
+          (when (and (> (loom-priority-queue-len queue) 0)
+                     (< idx (loom-priority-queue-len queue)))
             (let ((parent-idx (floor (1- idx) 2)))
               ;; The swapped element might need to move up or down.
               ;; Check if it has higher priority than its new parent.
               (if (and (> idx 0)
                        (funcall (loom-priority-queue-comparator queue)
                                 (aref heap idx)
-                                (aref heap parent-idx)))
+                                (aref heap parent-idx))) 
                   (loom--priority-queue-heapify-up queue idx)
-                (loom--priority-queue-heapify-down queue idx)))))
-        t))))
+                (loom--priority-queue-heapify-down queue idx))))
+        t)))))
+
+;;;###autoload
+(defun loom:priority-queue-clear (queue)
+  "Remove all items from the priority `QUEUE`.
+Time complexity: O(1). This operation is thread-safe.
+
+Arguments:
+- `QUEUE` (loom-priority-queue): The priority queue to clear.
+
+Returns:
+- `nil`."
+  (loom--validate-priority-queue queue 'loom:priority-queue-clear)
+  (loom:with-mutex! (loom-priority-queue-lock queue)
+    (setf (loom-priority-queue-len queue) 0)
+    (setf (loom-priority-queue-heap queue)
+          (make-vector (length (loom-priority-queue-heap queue)) nil)))
+  nil)
 
 ;;;###autoload
 (defun loom:priority-queue-status (queue)

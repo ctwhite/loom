@@ -45,6 +45,9 @@
 (defconst loom-version "1.0.0"
   "The version number of the loom.el library.")
 
+(defgroup loom nil "Asynchronous programming primitives for Emacs."
+  :group 'emacs)
+
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Core Concur Modules Loading
 
@@ -57,6 +60,7 @@
 (require 'loom-lock)
 (require 'loom-queue)
 (require 'loom-priority-queue)
+(require 'loom-thread-polling)
 
 ;; Schedulers and Core Promise System
 (require 'loom-microtask)

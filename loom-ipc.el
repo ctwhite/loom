@@ -1,41 +1,32 @@
-;;; loom-ipc.el --- Inter-Process/Thread Communication (IPC) for Concur -*- lexical-binding: t; -*-
+;;; loom-ipc.el --- Inter-Process/Thread Communication (IPC) -*- lexical-binding: t; -*-
 
 ;;; Commentary:
 ;;
 ;; This module provides the core Inter-Process/Thread Communication (IPC)
 ;; mechanisms for the Loom concurrency library. It enables safe and
 ;; efficient message passing between different Emacs Lisp threads and
-;; external processes, ensuring that asynchronous operations can
-;; communicate their results back to the main Emacs thread without blocking
-;; the UI.
+;; external processes.
 ;;
-;; This module now **owns and manages all its global IPC state**, making it
-;; a self-contained and robust subsystem. The design centers on two primary
-;; communication pathways, both dispatching to the main Emacs event loop.
+;; The central design principle is that all state-changing operations, such as
+;; settling a promise, must occur on the main Emacs thread. This module
+;; provides the transport layer to make that happen. Messages from background
+;; threads are placed on a queue that is periodically drained by the main
+;; thread's scheduler, ensuring thread safety and preventing race conditions.
 ;;
 ;; ## Key Features
 ;;
-;; - **Thread-Safe Queue:** When running in an Emacs with thread support, a
-;;   dedicated, mutex-protected queue (`loom--ipc-main-thread-queue`) is
-;;   used for messages from background threads. This provides a direct,
-;;   low-overhead in-memory communication channel.
+;; - **Main Thread Queue:** A dedicated, thread-safe queue
+;;   (`loom--ipc-main-thread-queue`) serves as the single inbox for all
+;;   messages from background threads destined for the main thread.
 ;;
-;; - **Process-Based IPC:** A long-lived pipe process (`loom--ipc-process`)
-;;   serves as a general-purpose event source. It is used to asynchronously
-;;   re-queue work onto the main thread's event loop, even from the main
-;;   thread itself. This ensures a consistent, non-blocking asynchronous
-;;   workflow. Data sent through the pipe is JSON-serialized.
+;; - **Inter-Emacs-Process Communication (IEPC):** A robust mechanism for
+;;   two or more Emacs instances to communicate using named pipes (FIFOs),
+;;   managed by the `loom-pipe` module. Data is JSON-serialized for transit.
 ;;
-;; - **Polling-Based Draining:** The main thread is responsible for
-;;   draining the in-memory queue by periodically calling
-;;   `loom:ipc-drain-queue`. This is typically done within the main
-;;   scheduler tick. This polling design avoids the complexity of a
-;;   dedicated drain thread.
-;;
-;; - **Unified Dispatcher:** The function `loom:dispatch-to-main-thread`
-;;   acts as a single, intelligent entry point. It automatically selects the
-;;   correct communication channel (in-memory queue or process pipe) based
-;;   on the execution context (background thread vs. main thread).
+;; - **Intelligent Dispatcher:** The function `loom:dispatch-to-main-thread`
+;;   acts as a single entry point, automatically selecting the correct
+;;   communication channel (main thread queue or named pipe) based on the
+;;   execution context.
 
 ;;; Code:
 
@@ -44,433 +35,473 @@
 (require 's)
 
 (require 'loom-log)
+(require 'loom-errors)
+(require 'loom-pipe)
 (require 'loom-lock)
 (require 'loom-queue)
-(require 'loom-errors)
-(require 'loom-registry)
-(require 'loom-promise)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Forward Declarations
 
-(declare-function loom-promise-p "loom-promise")
-(declare-function loom:pending-p "loom-promise")
+(declare-function loom:deferred "loom-config")
+(declare-function loom:deserialize-error "loom-errors")
 (declare-function loom:resolve "loom-promise")
 (declare-function loom:reject "loom-promise")
+(declare-function loom:pending-p "loom-promise")
 (declare-function loom-registry-get-promise-by-id "loom-registry")
-(declare-function loom:deserialize-error "loom-errors")
-(declare-function loom-error-p "loom-errors")
-(declare-function loom:serialize-error "loom-errors")
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Global State & Constants
 
-(defvar loom--ipc-queue-mutex nil
-  "A `loom:lock` (mutex) that provides thread-safe, exclusive access to
-the `loom--ipc-main-thread-queue`. This is essential for preventing race
-conditions when multiple threads enqueue messages simultaneously.
-
-It is initialized by `loom:ipc-init` and is private to this module.")
-
 (defvar loom--ipc-main-thread-queue nil
-  "A thread-safe `loom:queue` for messages originating from background
-threads and destined for the main Emacs thread. It is drained
-periodically by `loom:ipc-drain-queue` on the main thread.
+  "A thread-safe `loom:queue` for messages from background threads.
+This queue is the primary mechanism for background threads to send
+promise settlement messages to the main Emacs thread for safe
+processing. It is protected by `loom--ipc-queue-mutex` and is
+drained by `loom:ipc-drain-queue` during the main scheduler tick.")
 
-It is initialized by `loom:ipc-init` and is private to this module.")
+(defvar loom--ipc-queue-mutex nil
+  "A mutex protecting `loom--ipc-main-thread-queue`.
+This lock ensures that multiple background threads can enqueue
+messages concurrently without corrupting the queue's internal state.")
 
-(defvar loom--ipc-process nil
-  "The long-lived `make-pipe-process` instance used for IPC. This process
-acts as an event source for the main Emacs event loop. Messages sent to it
-are received by the filter function (`loom--ipc-filter`) on the main
-thread, providing a mechanism for asynchronous execution.
+;; IEPC specific loom-pipe instances
+(defvar loom--ipc-input-pipe nil
+  "The `loom-pipe` instance for reading from this Emacs instance's
+named input pipe (FIFO). When messages arrive from another Emacs
+process, they are read through this pipe, parsed, and enqueued to
+the `loom--ipc-main-thread-queue` for processing.")
 
-It is managed by `loom:ipc-init` and `loom:ipc-cleanup` and is private.")
+(defvar loom--ipc-output-pipe nil
+  "The `loom-pipe` instance for writing to a target Emacs instance's
+named input pipe (FIFO). This is used to send serialized
+settlement messages to another Emacs process.")
 
-(defvar loom--ipc-buffer nil
-  "A dedicated temporary buffer used by the process filter function
-`loom--ipc-filter` to accumulate incoming data chunks. This is necessary
-because process output can arrive in arbitrary fragments, and this buffer
-ensures we only process complete, newline-terminated lines.
+(defvar loom--ipc-my-id nil
+  "A unique string identifier for this Emacs instance.
+This ID is used to construct the filename for this instance's
+input FIFO. It is set during `loom:ipc-init`.")
 
-It is managed by `loom:ipc-init` and `loom:ipc-cleanup` and is private.")
+(defvar loom--ipc-target-instance-id nil
+  "The string identifier of the target Emacs instance for IEPC.
+This is used to construct the path to the target's input FIFO,
+allowing this instance to send messages to it. It is set during
+`loom:ipc-init`.")
+
+(defvar loom--ipc-listen-for-incoming-p nil
+  "A boolean indicating if this instance should listen for IEPC messages.
+If non-nil, an input pipe is created during `loom:ipc-init`,
+allowing other Emacs processes to send messages to this one.")
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Error Definitions
 
-(define-error 'loom-ipc-queue-uninitialized-error
-  "Error signaled when an operation is attempted on the IPC queue
-before it has been properly initialized by `loom:ipc-init`."
+(define-error 'loom-ipc-error
+  "Generic IPC error."
   'loom-error)
 
+(define-error 'loom-ipc-uninitialized-error
+  "IPC not initialized."
+  'loom-ipc-error)
+
 (define-error 'loom-ipc-process-error
-  "Error signaled when the underlying IPC pipe process encounters a
-fatal error or fails to initialize."
-  'loom-error)
+  "IPC process failed."
+  'loom-ipc-error)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Internal IPC Helpers
 
-(defun loom--ipc-enqueue (message)
-  "Thread-safely enqueues a `MESSAGE` onto the main thread's IPC queue.
-
-This is the primary entry point for a background thread to send data to
-the main thread. It acquires a mutex lock to ensure that the queue
-operation is atomic and safe from race conditions.
+(defun loom--ipc-get-fifo-path (instance-id)
+  "Construct the full, predictable path for an INSTANCE-ID's FIFO.
+This helper function centralizes the logic for creating named pipe
+paths. It uses Emacs's `temporary-file-directory` variable to
+ensure the pipes are created in a portable, system-appropriate
+location, rather than hardcoding `/tmp/`.
 
 Arguments:
-- `MESSAGE` (any): The message to enqueue, typically a plist.
+- `INSTANCE-ID` (string): The unique identifier for the Emacs instance.
 
 Returns:
-- `nil`.
+A string containing the full, absolute path for the FIFO file."
+  (expand-file-name (format "loom-ipc-%s-in.fifo" instance-id)
+                    temporary-file-directory))
 
-Signals:
-- `loom-ipc-queue-uninitialized-error`: If the IPC queue or its
-  mutex has not been initialized via `loom:ipc-init`."
-  ;; Ensure the core IPC components for threading are ready.
-  (unless (and loom--ipc-queue-mutex loom--ipc-main-thread-queue)
-    (signal 'loom-ipc-queue-uninitialized-error
-            '(:message "Main thread IPC queue/mutex not initialized.")))
-  ;; Lock the mutex, enqueue the message, and release the lock.
-  (loom:with-mutex! loom--ipc-queue-mutex
-    (loom:queue-enqueue loom--ipc-main-thread-queue message))
-  (loom-log :debug (plist-get message :id) "Enqueued message for main thread.")
-  nil)
-
-(defun loom--ipc-parse-pipe-line (line-text)
-  "Parses a single, newline-terminated JSON string from the IPC process.
-
-This function decodes the JSON payload and dispatches it based on the
-message `:type`. It is designed to be robust against malformed JSON
-or unexpected message types.
+(defun loom--ipc-settle-promise-from-payload (payload)
+  "Settle a promise using the data from a PAYLOAD on the main thread.
+This function is the final destination for messages that have arrived
+via IPC and have been drained from the queue by the main scheduler.
+It looks up the promise by its ID in the global registry and
+settles it with the provided value or error, which in turn
+triggers the promise's callback chain.
 
 Arguments:
-- `LINE-TEXT` (string): A complete JSON string received from the pipe.
+- `PAYLOAD` (plist): A fully deserialized message payload,
+  containing at least an `:id` and either a `:value` or `:error`.
 
-Returns: `nil`. Errors are logged but not re-thrown."
-  (cl-block loom--ipc-parse-pipe-line
-    ;; Ignore empty or whitespace-only lines.
-    (when (s-blank? line-text)
-      (cl-return-from loom--ipc-parse-pipe-line nil)))
+Returns: `nil`.
 
-  ;; Use a condition-case to gracefully handle parsing errors.
-  (condition-case err
-      ;; Configure JSON parsing to use plists and keywords for consistency.
-      (let* ((json-object-type 'plist)
-             (json-array-type 'list)
-             (json-key-type 'keyword)
-             (payload (json-read-from-string line-text))
-             (msg-type (plist-get payload :type)))
-        ;; Dispatch the message based on its type.
-        (pcase msg-type
-          (:promise-settled
-           (loom:process-settled-on-main payload))
-          (:log
-           (let ((level (plist-get payload :level))
-                 (message (plist-get payload :message)))
-             (when (and level message)
-               (loom-log level nil "IPC remote log: %s" message))))
-          (_
-           (loom-log :warn nil
-                     "IPC filter received unknown message type: %S" msg-type))))
-    (json-error
-     (loom-log :error nil "JSON parse error in IPC: %S, line: %S"
-               err line-text))
-    (error
-     (loom-log :error nil "General error parsing IPC message: %S, line: %S"
-               err line-text))))
+Side Effects:
+- Calls `loom:resolve` or `loom:reject` on a registered promise. This
+  alters the promise's state and schedules its callbacks for
+  asynchronous execution on the schedulers."
+  (let* ((id (plist-get payload :id))
+         (promise (loom-registry-get-promise-by-id id)))
+    (if (and promise (loom:pending-p promise))
+        (let ((value (plist-get payload :value))
+              (error-data (plist-get payload :error)))
+          (if error-data
+              (loom:reject promise error-data)
+            (loom:resolve promise value)))
+      ;; This is a normal, expected condition if a promise was cancelled or
+      ;; timed out before its settlement message arrived from a thread.
+      (loom-log :debug id "IPC received settlement for non-pending promise."))))
+
+(defun loom--ipc-fully-deserialize-payload (payload)
+  "Fully deserialize a raw PAYLOAD from an IEPC pipe.
+This function is responsible for the second layer of deserialization
+that is necessary for messages received over IEPC. Because JSON
+cannot natively represent all Lisp types (like `loom-error` structs
+or complex lists), such values are first encoded into a JSON string
+and embedded within the main JSON payload. This function reverses
+that process.
+
+Arguments:
+- `PAYLOAD` (plist): A plist parsed from the top-level JSON message.
+
+Returns:
+A new plist with all values fully deserialized into proper Lisp objects."
+  (let* ((value (plist-get payload :value))
+         (error-data (plist-get payload :error))
+         (value-is-json (plist-get payload :value-is-json))
+         (final-payload (copy-sequence payload)))
+
+    ;; If the `:value-is-json` hint is present, parse the value string.
+    (when (and value-is-json (stringp value))
+      (setf (plist-get final-payload :value) (json-read-from-string value)))
+
+    ;; If the error data is a plist (indicating it was a serialized
+    ;; `loom-error`), deserialize it back into a struct.
+    (when (and error-data (plistp error-data))
+      (setf (plist-get final-payload :error) (loom:deserialize-error error-data)))
+
+    ;; Remove the hint, as it's no longer needed.
+    (setf (plist-get final-payload :value-is-json) nil)
+    final-payload))
+
+(defun loom--ipc-parse-and-process-line (line-text)
+  "Parse a JSON string from an IEPC pipe and enqueue it for processing.
+This function acts as the entry point for raw data coming from an
+external Emacs process. It is designed to be robust, logging any
+parsing errors without propagating them, which prevents a single
+malformed message from crashing the entire IPC listener.
+
+Arguments:
+- `LINE-TEXT` (string): A complete, newline-terminated JSON string
+  received from the pipe.
+
+Returns: `nil`.
+
+Side Effects:
+- Enqueues a fully deserialized payload to the main thread queue,
+  which makes it available to the main scheduler."
+  (when-let ((trimmed-line (s-trim line-text)))
+    (condition-case err
+        (let* ((json-object-type 'plist)
+               (json-array-type 'list)
+               (json-key-type 'keyword)
+               (raw-payload (json-read-from-string trimmed-line))
+               (final-payload (loom--ipc-fully-deserialize-payload raw-payload)))
+          (loom-log :debug nil "IPC: Deserialized payload: %S" final-payload)
+          ;; Enqueue the parsed message onto the main thread's queue.
+          (loom:with-mutex! loom--ipc-queue-mutex
+            (loom:queue-enqueue loom--ipc-main-thread-queue final-payload)))
+      (json-error (loom-log :error nil "IPC: JSON parse error: %S" err))
+      (error (loom-log :error nil "IPC: Error processing line: %S" err)))))
 
 (defun loom--ipc-filter (process string)
-  "Process filter function for `loom--ipc-process`.
-
-This function is called by Emacs whenever `loom--ipc-process` writes to
-its standard output. Since data can arrive in arbitrary chunks, this
-function appends the incoming `STRING` to a dedicated buffer,
-`loom--ipc-buffer`, and then processes any complete, newline-terminated
-lines found in that buffer.
+  "Process filter for an IEPC input pipe. Buffers and processes lines.
+This function is attached to the pipe's underlying process and is
+called by Emacs whenever new data arrives. Because data can arrive
+in arbitrary chunks, this function appends the data to a buffer and
+processes only complete, newline-terminated lines.
 
 Arguments:
-- `PROCESS` (process): The `make-pipe-process` instance (unused).
+- `PROCESS` (process): The process that produced the output.
 - `STRING` (string): The latest chunk of output from the process.
 
-Returns: `nil`."
-  (condition-case err
-      (progn
-        ;; Ensure the dedicated buffer for this filter is alive.
-        (unless (buffer-live-p loom--ipc-buffer)
-          (setq loom--ipc-buffer (generate-new-buffer " *loom-ipc-filter*"))
-          (with-current-buffer loom--ipc-buffer
-            ;; Disable multibyte chars for raw data processing.
-            (setq-local enable-multibyte-characters nil)))
+Returns: `nil`.
 
-        ;; 1. Append the new chunk of data to our buffer.
-        (with-current-buffer loom--ipc-buffer
-          (save-excursion (goto-char (point-max)) (insert string)))
-
-        ;; 2. Process all complete lines in the buffer.
-        (with-current-buffer loom--ipc-buffer
-          (let ((line-start (point-min)))
-            (goto-char line-start)
-            ;; Search for the next newline character.
-            (while (re-search-forward "\n" nil t)
-              (let* ((line-end (match-end 0))
-                     ;; Extract the complete line without the newline.
-                     (line-text (buffer-substring-no-properties
-                                 line-start (1- line-end))))
-                ;; Parse the line if it contains content.
-                (unless (s-blank? line-text)
-                  (loom--ipc-parse-pipe-line line-text)))
-              ;; Move the start pointer to the beginning of the next line.
-              (setq line-start (point)))
-            ;; 3. Delete the processed lines from the buffer, leaving any
-            ;;    partial line for the next invocation.
-            (delete-region (point-min) line-start))))
-    (error (loom-log :error nil "Error in IPC filter: %S" err)))
-  nil)
+Side Effects:
+- Modifies the buffer associated with `PROCESS`.
+- Calls `loom--ipc-parse-and-process-line`, which enqueues tasks."
+  (let ((buffer (process-buffer process)))
+    (when (buffer-live-p buffer)
+      (with-current-buffer buffer
+        (save-excursion
+          (goto-char (point-max))
+          (insert string))
+        (while (string-match "\n" (buffer-string))
+          (let* ((line (buffer-substring-no-properties
+                        (point-min) (match-beginning 0))))
+            (delete-region (point-min) (match-end 0))
+            (loom--ipc-parse-and-process-line line)))))))
 
 (defun loom--ipc-sentinel (process event)
-  "Sentinel function for `loom--ipc-process`.
-
-This function is called by Emacs when the state of `loom--ipc-process`
-changes (e.g., it exits or crashes). Its primary purpose is to detect
-unexpected termination and trigger a cleanup and re-initialization
-cycle to maintain system stability.
+  "Sentinel for an IPC pipe process. Cleans up on unexpected termination.
+This function is attached to the pipe's process to monitor its
+state. If the process dies unexpectedly, it triggers a full IPC
+cleanup to prevent the system from being left in a broken state.
 
 Arguments:
 - `PROCESS` (process): The process whose state changed.
 - `EVENT` (string): A string describing the state change event.
 
-Returns: `nil`."
-  (loom-log :warn nil "IPC process sentinel triggered: %s" (s-trim event))
-  ;; If the process terminated unexpectedly, it's a critical failure.
+Returns: `nil`.
+
+Side Effects:
+- Calls `loom:ipc-cleanup` if the process terminates unexpectedly."
+  (loom-log :warn nil "IPC sentinel for process %S: %s" process (s-trim event))
   (when (string-match-p "\\(finished\\|exited\\|failed\\)" event)
     (loom-log :error nil "IPC process terminated unexpectedly. Cleaning up.")
-    ;; Clean up all IPC resources to prevent a broken state.
-    (loom:ipc-cleanup))
-  nil)
+    (loom:ipc-cleanup)))
+
+(defun loom--ipc-init-thread-components ()
+  "Initialize the components for thread-based communication.
+This sets up the mutex and queue used to receive messages from
+background threads. It only runs if the Emacs instance supports
+native threads.
+
+Returns: `nil`.
+
+Side Effects:
+- Modifies the global `loom--ipc-queue-mutex` and
+  `loom--ipc-main-thread-queue` variables."
+  (when (fboundp 'make-thread)
+    (unless loom--ipc-queue-mutex
+      (setq loom--ipc-queue-mutex (loom:lock "loom-ipc-queue-mutex")))
+    (unless loom--ipc-main-thread-queue
+      (setq loom--ipc-main-thread-queue (loom:queue)))))
+
+(defun loom--ipc-init-iepc-pipes ()
+  "Initialize the Inter-Emacs-Process Communication (IEPC) pipes.
+This function creates the named pipes (FIFOs) and starts the
+underlying `cat` processes needed for communication between
+separate Emacs instances.
+
+Returns: `nil`.
+
+Side Effects:
+- Creates FIFO files on the filesystem.
+- Starts external processes via `loom:pipe`.
+- Modifies global pipe variables (`loom--ipc-input-pipe`, etc.).
+
+Signals:
+- `loom-ipc-process-error`: If `loom:pipe` fails."
+  (let ((my-input-path (loom--ipc-get-fifo-path loom--ipc-my-id))
+        (target-output-path (when loom--ipc-target-instance-id
+                              (loom--ipc-get-fifo-path loom--ipc-target-instance-id))))
+    (loom-log :info nil "IPC: Setting up IEPC for instance '%s'." loom--ipc-my-id)
+    (condition-case err
+        (progn
+          (when loom--ipc-listen-for-incoming-p
+            (loom-log :info nil "IPC: Listening on pipe: %s" my-input-path)
+            (setq loom--ipc-input-pipe
+                  (loom:pipe :path my-input-path :mode :read
+                             :filter #'loom--ipc-filter
+                             :sentinel #'loom--ipc-sentinel)))
+          (when loom--ipc-target-instance-id
+            (loom-log :info nil "IPC: Targeting pipe: %s" target-output-path)
+            (setq loom--ipc-output-pipe
+                  (loom:pipe :path target-output-path :mode :write
+                             :sentinel #'loom--ipc-sentinel))))
+      (error
+       (loom-log :error nil "IPC: Failed to initialize IEPC pipes: %S" err)
+       (loom:ipc-cleanup)
+       (signal 'loom-ipc-process-error
+               `(:message "Failed to init IEPC pipes" :cause ,err))))))
+
+(defun loom--ipc-serialize-payload-for-dispatch (payload)
+  "Serialize PAYLOAD for dispatch via an IEPC pipe.
+This is the counterpart to `loom--ipc-fully-deserialize-payload`.
+It prepares a Lisp plist for transport over a text-based medium
+by encoding complex values into JSON strings.
+
+Arguments:
+- `PAYLOAD` (plist): The original Lisp message payload.
+
+Returns:
+A JSON-encoded string ready for dispatch."
+  (let* ((payload-copy (copy-sequence payload))
+         (error-data (plist-get payload-copy :error))
+         (value-data (plist-get payload-copy :value)))
+    (when (and error-data (loom-error-p error-data))
+      (setf (plist-get payload-copy :error)
+            (loom:serialize-error error-data)))
+    (when (or (listp value-data) (hash-table-p value-data))
+      (setf (plist-get payload-copy :value) (json-encode value-data))
+      (setf (plist-get payload-copy :value-is-json) t))
+    (json-encode payload-copy)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Public IPC API
 
-(defun loom:process-settled-on-main (payload)
-  "Processes a settlement message that has arrived on the main thread.
-
-This function is the final destination for promise settlement messages,
-whether they arrive from the thread queue or the process pipe. It finds the
-target promise in the global registry and settles it with the provided
-value or error.
+;;;###autoload
+(cl-defun loom:ipc-init (&key my-id target-instance-id
+                             (listen-for-incoming-p t))
+  "Initialize all IPC mechanisms. This function is idempotent.
+This function sets up the necessary infrastructure for both
+inter-thread communication (if supported) and inter-process
+communication via named pipes.
 
 Arguments:
-- `PAYLOAD` (plist): A plist containing settlement data. Must include `:id`
-  and either `:value` or `:error`. May also include `:value-is-json` hint.
+- `:MY-ID` (string, optional): A unique string identifier for this
+  Emacs instance, used for naming its input FIFO. Defaults to the
+  current process ID.
+- `:TARGET-INSTANCE-ID` (string, optional): The ID of the target Emacs
+  instance for sending messages. If non-nil, an output pipe is created.
+- `:LISTEN-FOR-INCOMING-P` (boolean, optional): If t (the default),
+  create an input pipe to receive messages from other processes.
 
-Returns:
-- `nil`.
+Returns: `nil`.
 
 Side Effects:
-- Resolves or rejects a registered `loom-promise`, which will trigger its
-  callback chain to execute on the main thread."
-  (let* ((id (plist-get payload :id))
-         (promise (loom-registry-get-promise-by-id id)))
-    (if (and promise (loom:pending-p promise))
-        ;; The promise exists and is waiting for settlement.
-        (let* ((value (plist-get payload :value))
-               (error-data (plist-get payload :error))
-               (value-is-json (plist-get payload :value-is-json))
-               ;; If value was JSON-encoded for transport, decode it now.
-               (final-value (if (and value-is-json (stringp value))
-                                (json-read-from-string value)
-                              value))
-               ;; If the error was serialized for transport, deserialize it.
-               (final-error (if (and error-data (not (loom-error-p error-data)))
-                                (loom:deserialize-error error-data)
-                              error-data)))
-          ;; Settle the promise with either the final value or the final error.
-          (if final-error
-              (loom:reject promise final-error)
-            (loom:resolve promise final-value)))
-      ;; This can happen if a promise was cancelled or timed out before
-      ;; the settlement message arrived. It's not necessarily an error.
-      (loom-log :debug id
-                "IPC received settlement for non-pending/unknown promise."))))
+- Modifies global state variables (`loom--ipc-my-id`, etc.).
+- Initializes the main thread queue and its mutex.
+- May create FIFO files on the filesystem.
+- May start external `cat` processes to manage the FIFOs.
 
-;;;###autoload
-(defun loom:ipc-init ()
-  "Initializes all IPC mechanisms, including the thread queue and the
-process pipe. This function is idempotent and safe to call multiple times.
+Signals:
+- `loom-ipc-process-error`: If a required underlying process (e.g.,
+  for a pipe) fails to initialize."
+  (loom-log :info nil "IPC: Initializing Loom IPC system.")
+  (setq loom--ipc-my-id (or my-id (format "%d" (emacs-pid)))
+        loom--ipc-target-instance-id target-instance-id
+        loom--ipc-listen-for-incoming-p listen-for-incoming-p)
 
-Returns: `nil`."
-  (loom-log :info nil "Initializing Loom IPC system.")
+  (loom--ipc-init-thread-components)
+  (when (or listen-for-incoming-p target-instance-id)
+    (loom--ipc-init-iepc-pipes))
 
-  ;; Section 1: Initialize components for thread-based communication.
-  ;; This only runs if the current Emacs supports `make-thread`.
-  (when (fboundp 'make-thread)
-    (unless loom--ipc-queue-mutex
-      (setq loom--ipc-queue-mutex
-            (loom:lock "loom-ipc-queue-mutex" :mode :thread)))
-    (unless (loom-queue-p loom--ipc-main-thread-queue)
-      (setq loom--ipc-main-thread-queue (loom:queue))))
-
-  ;; Section 2: Initialize the process-based communication channel.
-  ;; This runs on all Emacs versions and is the primary async mechanism.
-  (unless (and loom--ipc-process (process-live-p loom--ipc-process))
-    (condition-case err
-        (progn
-          (setq loom--ipc-buffer
-                (generate-new-buffer " *loom-ipc-filter*"))
-          (setq loom--ipc-process
-                (make-pipe-process
-                 :name "loom-ipc-listener"
-                 :noquery t
-                 :coding 'utf-8-emacs-unix
-                 :filter #'loom--ipc-filter
-                 :sentinel #'loom--ipc-sentinel)))
-      (error
-       ;; If process creation fails, log the error and ensure a clean state.
-       (loom-log :error nil "Failed to initialize IPC pipe process: %S" err)
-       (when loom--ipc-buffer (kill-buffer loom--ipc-buffer))
-       (setq loom--ipc-process nil loom--ipc-buffer nil)
-       (signal 'loom-ipc-process-error (list err)))))
+  (loom-log :info nil "IPC: System initialized.")
   nil)
 
 ;;;###autoload
 (defun loom:ipc-cleanup ()
-  "Shuts down and cleans up all IPC resources.
+  "Shut down and clean up all IPC resources. This function is idempotent.
+It is automatically called on Emacs shutdown via a hook.
 
-This function stops the IPC process, kills its associated buffer, and
-resets all global state variables. It is idempotent and safe to call
-even if the system is already clean. It is hooked into `kill-emacs-hook`
-to ensure graceful shutdown.
+Returns: `nil`.
 
-Returns: `nil`."
-  (loom-log :info nil "Cleaning up IPC resources.")
-  ;; Reset thread-related state variables.
-  (setq loom--ipc-queue-mutex nil)
-  (setq loom--ipc-main-thread-queue nil)
-
-  ;; Shut down the long-lived IPC process.
-  (when (and loom--ipc-process (process-live-p loom--ipc-process))
-    (delete-process loom--ipc-process))
-  (setq loom--ipc-process nil)
-
-  ;; Clean up the dedicated IPC filter buffer.
-  (when (and loom--ipc-buffer (buffer-live-p loom--ipc-buffer))
-    (kill-buffer loom--ipc-buffer))
-  (setq loom--ipc-buffer nil)
+Side Effects:
+- Terminates all IPC-related processes via `loom:pipe-cleanup`.
+- Deletes any created FIFO files from the filesystem.
+- Kills any associated buffers.
+- Resets all global IPC state variables to `nil`."
+  (loom-log :info nil "IPC: Cleaning up resources.")
+  (setq loom--ipc-main-thread-queue nil loom--ipc-queue-mutex nil)
+  (when loom--ipc-input-pipe (loom:pipe-cleanup loom--ipc-input-pipe))
+  (setq loom--ipc-input-pipe nil)
+  (when loom--ipc-output-pipe (loom:pipe-cleanup loom--ipc-output-pipe))
+  (setq loom--ipc-output-pipe nil)
+  (setq loom--ipc-my-id nil
+        loom--ipc-target-instance-id nil
+        loom--ipc-listen-for-incoming-p nil)
+  (loom-log :info nil "IPC: Cleanup complete.")
   nil)
 
 ;;;###autoload
 (defun loom:ipc-drain-queue ()
-  "Drains and processes all messages from the in-memory IPC queue.
+  "Drain and process all messages from the main thread IPC queue.
+This function is a critical part of the main scheduler tick. It
+safely transfers all pending messages from the shared, thread-safe
+queue to a local list and then processes them one by one on the
+main thread. This design ensures that the mutex protecting the
+queue is held for the shortest possible time, minimizing contention.
 
-This function should be called periodically from the main thread,
-typically as part of a central scheduler's tick. It performs a two-step
-process to minimize the time a mutex is held:
-1. Atomically transfer all messages from the global queue to a local list.
-2. Process the messages from the local list, now that the lock is released.
+Returns: `nil`.
 
-Returns:
-- (integer): The number of messages that were processed."
-  (let ((messages-to-process '())
-        (processed-count 0))
-    ;; Step 1: Atomically grab all messages from the shared queue. This
-    ;; block is kept as short as possible to avoid blocking producer threads.
-    (when (and loom--ipc-queue-mutex loom--ipc-main-thread-queue)
+Side Effects:
+- Dequeues all items from `loom--ipc-main-thread-queue`.
+- Calls `loom--ipc-settle-promise-from-payload` for each message,
+  which in turn settles promises and triggers their callbacks."
+  (when loom--ipc-main-thread-queue
+    (let (messages-to-process)
+      ;; Atomically grab all messages from the shared queue.
       (loom:with-mutex! loom--ipc-queue-mutex
         (while (not (loom:queue-empty-p loom--ipc-main-thread-queue))
           (push (loom:queue-dequeue loom--ipc-main-thread-queue)
-                messages-to-process))))
-
-    ;; Step 2: Process the collected messages outside the mutex lock.
-    ;; This allows other threads to enqueue new messages while we work.
-    (when messages-to-process
-      ;; Messages were pushed onto the list, so nreverse restores FIFO order.
-      (setq messages-to-process (nreverse messages-to-process))
-      (setq processed-count (length messages-to-process))
-      (loom-log :debug nil
-                "Draining %d messages from IPC queue." processed-count)
-      ;; Process each message, which typically involves settling a promise.
-      (dolist (message messages-to-process)
-        (loom:process-settled-on-main message)))
-    processed-count))
+                messages-to-process)))
+      ;; Process the collected messages on the main thread.
+      (when messages-to-process
+        (dolist (payload (nreverse messages-to-process))
+          (loom--ipc-settle-promise-from-payload payload))))))
 
 ;;;###autoload
 (defun loom:dispatch-to-main-thread (promise &optional message-type data)
-  "Dispatches a settlement message for a `PROMISE` to the main thread.
+  "Dispatch a settlement message for a PROMISE to be processed.
+This is the universal function for sending a promise result back
+for processing on the main Emacs event loop. It intelligently
+chooses the correct communication channel based on the current
+execution context, ensuring all paths are asynchronous.
 
-This is the universal function for sending a promise result back for
-processing on the main Emacs event loop. It intelligently chooses the
-correct communication channel based on the current context.
+The function determines the dispatch path as follows:
+1.  If called from a background thread, it enqueues the payload
+    to the thread-safe `loom--ipc-main-thread-queue`.
+2.  If called from the main thread with an active IEPC output pipe,
+    it serializes the payload and sends it to the external process.
+3.  As a fallback (e.g., on the main thread with no IEPC), it
+    schedules the settlement for a future tick of the event loop
+    using `loom:deferred` to maintain asynchronicity.
 
 Arguments:
-- `PROMISE` (loom-promise): The promise object being settled.
-- `MESSAGE-TYPE` (symbol, optional): The message type, which defaults to
-  `:promise-settled`.
-- `DATA` (plist, optional): The message payload, typically `(:value ...)`
-  or `(:error ...)`.
+- `PROMISE` (loom-promise): The promise object being settled. This
+  is used to construct the message payload.
+- `MESSAGE-TYPE` (symbol, optional): The type of message, which
+  defaults to `:promise-settled`. This is for potential future
+  expansion with other message types.
+- `DATA` (plist, optional): The core message payload, typically
+  containing a `:value` or `:error` key for settlement.
 
-Returns: `nil`."
+Returns: `nil`. The function's purpose is to initiate an
+asynchronous action, not to return a value.
+
+Side Effects:
+- Enqueues a Lisp object onto the `loom--ipc-main-thread-queue`.
+- OR sends a serialized JSON string to an external OS process.
+- OR schedules a lambda function on the macrotask scheduler.
+
+Signals:
+- `wrong-type-argument`: If `PROMISE` is not a `loom-promise` object."
   (unless (loom-promise-p promise)
     (signal 'wrong-type-argument (list 'loom-promise-p promise)))
 
-  ;; Construct the full message payload.
   (let* ((promise-id (loom-promise-id promise))
-         (full-payload (append `(:id ,promise-id
-                                 :type ,(or message-type :promise-settled))
-                               data)))
+         (payload (append `(:id ,promise-id
+                            :type ,(or message-type :promise-settled))
+                          data)))
     (cond
-      ;; Path 1: Executing in a background thread.
-      ;; Use the fast, in-memory, thread-safe queue. Data is passed directly
-      ;; as a Lisp object, as we are in the same Emacs process.
-      ((and (fboundp 'current-thread) (not (eq (current-thread) (thread-main))))
-       (condition-case err
-           (loom--ipc-enqueue full-payload)
-         (error (loom-log :error promise-id
-                          "Thread queue dispatch failed: %S" err))))
+     ;; Path 1: In a background thread. Enqueue to the main thread queue.
+     ((and (fboundp 'make-thread) (not (eq (current-thread) main-thread)))
+      (loom-log :info promise-id "IPC: Dispatching from background thread.")
+      (loom:with-mutex! loom--ipc-queue-mutex
+        (loom:queue-enqueue loom--ipc-main-thread-queue payload)))
 
-      ;; Path 2: Executing on the main thread or in a process context.
-      ;; Use the pipe process to schedule the work asynchronously on the
-      ;; main event loop. This is crucial for maintaining a non-blocking
-      ;; pattern even when an async operation finishes immediately.
-      ((and loom--ipc-process (process-live-p loom--ipc-process))
-       (condition-case err
-           (let* ((payload-to-send (copy-sequence full-payload))
-                  (error-data (plist-get payload-to-send :error))
-                  (value-data (plist-get payload-to-send :value)))
+     ;; Path 2: In main thread with an active IEPC output pipe. Send via pipe.
+     ((and loom--ipc-output-pipe
+           (process-live-p (loom-pipe-process loom--ipc-output-pipe)))
+      (loom-log :info promise-id "IPC: Dispatching via IEPC to target '%s'."
+                loom--ipc-target-instance-id)
+      (let ((json-msg (loom--ipc-serialize-payload-for-dispatch payload)))
+        (loom:pipe-send loom--ipc-output-pipe (format "%s\n" json-msg))))
 
-             ;; If the payload contains a structured error, it must be
-             ;; serialized into a plist before JSON encoding.
-             (when (and error-data (loom-error-p error-data))
-               (setf (plist-get payload-to-send :error)
-                     (loom:serialize-error error-data)))
-
-             ;; If the value is a complex Lisp type (list/hash), it must
-             ;; be serialized to a JSON string. We add a hint so the receiver
-             ;; knows to parse it.
-             (when (or (listp value-data) (hash-table-p value-data))
-               (setf (plist-get payload-to-send :value)
-                     (json-encode value-data))
-               (setf (plist-get payload-to-send :value-is-json) t))
-
-             ;; Encode the final payload to a JSON string and send it to the
-             ;; pipe, followed by a newline to mark the end of the message.
-             (let ((json-message (json-encode payload-to-send)))
-               (process-send-string loom--ipc-process
-                                    (format "%s\n" json-message))))
-         (error (loom-log :error promise-id
-                          "IPC process dispatch failed: %S" err))))
-
-      ;; Path 3: Fallback for when the IPC process isn't ready.
-      ;; This is a last resort to prevent losing the message. It uses
-      ;; `run-at-time` to schedule the processing on a future tick of the
-      ;; event loop, simulating the asynchronicity of the pipe.
-      (t
-       (loom-log :warn promise-id "IPC dispatch falling back to run-at-time.")
-       (run-at-time 0 nil #'loom:process-settled-on-main full-payload)))
+     ;; Path 3: Fallback. Schedule for a future tick on the main thread.
+     (t
+      (loom-log :warn promise-id
+                "IPC: No async channel. Scheduling for deferred processing.")
+      (loom:deferred (lambda () (loom--ipc-settle-promise-from-payload payload)))))
     nil))
 
 ;; Register a hook to ensure IPC resources are released when Emacs exits.
-;; This prevents orphaned processes or memory leaks.
 (add-hook 'kill-emacs-hook #'loom:ipc-cleanup)
 
 (provide 'loom-ipc)
