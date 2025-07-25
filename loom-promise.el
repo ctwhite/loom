@@ -18,28 +18,33 @@
 ;;   asynchronously, preventing stack overflow and ensuring a consistent
 ;;   execution order.
 ;;
-;; - **Centralized State Management:** To eliminate race conditions, all state
-;;   transitions (settling a promise) for `:thread` and `:process` mode promises
-;;   are funneled through the main Emacs thread via the IPC mechanism. A
-;;   background thread or process's attempt to settle a promise dispatches a
-;;   message to the main thread, which then performs the actual state change.
-;;   This makes the main thread the single source of truth for a promise's
-;;   lifecycle.
+;; - **Abstracted Main Thread Dispatch:** All state transitions (settling a
+;;   promise) are guaranteed to happen on the main Emacs thread. This module
+;;   achieves this without direct knowledge of threads or processes by
+;;   consulting `loom-promise-async-dispatch-predicate-functions`. If any
+;;   function on this hook returns non-nil, the settlement is deferred
+;;   to the main thread via `loom:deferred`. This allows external modules
+;;   (like `warp`) to "plug in" their awareness of off-main-thread contexts.
 ;;
 ;; - **Cooperative `await`:** The `loom:await` macro provides a way to write
-;;   synchronous-looking code that consumes promises. Critically, it does **not**
-;;   perform a hard block. Instead, it enters a cooperative polling loop that
-;;   repeatedly runs the Loom scheduler and yields control, keeping the Emacs
-;;   UI responsive.
+;;   synchronous-looking code that consumes promises. Critically, it does
+;;   **not** perform a hard block. Instead, it enters a cooperative polling
+;;   loop that repeatedly runs the Loom scheduler and yields control, keeping
+;;   the Emacs UI responsive. This relies on `loom-poll.el`.
 ;;
 ;; - **Flexible Concurrency Modes:** Supports promises that encapsulate work
 ;;   in different contexts:
-;;   - `:deferred`: For operations on the main Emacs thread's event loop.
-;;   - `:thread`: For tasks offloaded to a shared thread pool.
-;;   - `:process`: For tasks offloaded to a shared background process pool.
+;;   - `:deferred`: For operations explicitly scheduled on the main Emacs
+;;     thread's event loop.
+;;   - `:thread`: (Conceptual) For tasks offloaded to a thread pool.
+;;   - `:process`: (Conceptual) For tasks offloaded to a background process pool.
+;;     (Note: Actual implementation of `:thread` and `:process` modes, including
+;;     the associated `proc` field and `loom--promise-kill-associated-process`,
+;;     depends on external modules like `warp`.)
 ;;
-;; - **Cancellation:** Integrates with `loom-cancel-token` to allow for the
-;;   propagation of cancellation requests through a chain of promises.
+;; - **Cancellation:** Integrates with `loom-cancel-token` (from `loom-cancel.el`)
+;;   to allow for the propagation of cancellation requests through a chain of
+;;   promises.
 ;;
 ;; - **Unhandled Rejection Tracking:** The system can detect when a promise is
 ;;   rejected but has no error handler attached, helping to identify silent
@@ -47,57 +52,59 @@
 
 ;;; Code:
 
-(require 'cl-lib)
-(require 's)
-(require 'dash)
-(require 'subr-x)
+(require 'cl-lib) ; Common Lisp extensions for enhanced programming
+(require 's)      ; String manipulation library
+(require 'dash)   ; List manipulation functions (e.g., `-flatten`, `-filter`)
+(require 'subr-x) ; `float-time` for timestamps
 
-(require 'loom-log)
-(require 'loom-lock)
-(require 'loom-registry)
-(require 'loom-errors)
-(require 'loom-callback)
-(require 'loom-poll)
-(require 'loom-thread-pool)
-(require 'loom-multiprocess)
+(require 'loom-lock)     ; For `loom-lock` struct and `loom:lock`
+(require 'loom-registry) ; For `loom-registry-register-promise`, etc.
+(require 'loom-error)   ; For `loom-error` struct and `loom:error!`
+(require 'loom-callback) ; For `loom-callback` struct and `loom:ensure-callback`
+(require 'loom-context)  ; For `loom-context-capture-call-site` and `make-loom-call-site`
+(require 'loom-poll)     ; For `loom:poll-with-backoff` and `loom:poll-default`
+
+;; Removed loom-ipc requirements.
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Forward Declarations
+;;; 1. Forward Declarations
+;; Functions that are defined elsewhere but called in this module.
 
 (declare-function loom-cancel-token-p "loom-cancel")
 (declare-function loom-cancel-token-add-callback "loom-cancel")
-(declare-function loom:deferred "loom-config")
-(declare-function loom:microtask "loom-config")
-(declare-function loom:scheduler-tick "loom-config")
-(declare-function loom:dispatch-to-main-thread "loom-ipc")
-(declare-function loom:serialize-error "loom-errors")
+(declare-function loom:deferred "loom-config")    ; For scheduling macrotasks
+(declare-function loom:microtask "loom-config")   ; For scheduling microtasks
+(declare-function loom:scheduler-tick "loom-config") ; For cooperative `await` polling
+(declare-function loom:then "loom-primitives")    ; For promise chaining syntax
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Customization
+;;; 2. Customization Variables
 
 (defcustom loom-log-value-max-length 100
-  "Maximum length of a value or error string included in log messages.
-Longer values will be truncated to keep logs readable."
+  "Maximum length of a value or error string included in log messages
+generated by `loom:promise-format`. Longer values will be truncated
+to keep logs readable."
   :type 'integer
   :group 'loom)
 
 (defcustom loom-await-poll-interval 0.01
   "The polling interval (in seconds) for the cooperative `loom:await` loop.
 This determines how frequently `await` checks if the promise has settled
-while it is 'blocking'."
+while it is 'blocking' (i.e., yielding control)."
   :type 'float
   :group 'loom)
 
 (defcustom loom-await-default-timeout 10.0
   "Default timeout (in seconds) for `loom:await` if one is not specified.
 If set to `nil`, `loom:await` will wait indefinitely by default, which may
-not be desirable in all contexts."
+not be desirable in all contexts as it could lead to unresponsive behavior
+if the awaited promise never settles."
   :type '(choice (float :min 0.0) (const :tag "Indefinite" nil))
   :group 'loom)
 
 (defcustom loom-normalize-awaitable-hook nil
   "A hook for converting arbitrary objects into `loom-promise` instances.
-This allows `loom:await` and `loom:resolve` to work with objects from
+This allows `loom:await` and `loom:promise-resolve` to work with objects from
 other libraries (e.g., `url-retrieve-synchronously`'s request objects)
 by wrapping them in a standard promise interface.
 
@@ -105,455 +112,550 @@ Each function on the hook receives one argument, the object to normalize.
 If a function recognizes the object type, it should return a new
 `loom-promise` that settles when the original object completes its
 asynchronous work. If it does not recognize the object, it must return `nil`
-to allow other hook functions to run."
+to allow other hook functions to run. Functions on this hook are run in order."
   :type 'hook
   :group 'loom)
 
+(defvar loom-promise-async-dispatch-predicate-functions nil
+  "List of functions to call to determine if an async dispatch is needed.
+Each function takes no arguments and returns non-nil if a special
+dispatch (e.g., to the main Emacs thread from a background context)
+is required. Functions are called in order, and the first non-nil
+return determines the dispatch. This allows external modules (like
+`warp`) to 'plug in' their own thread or process awareness, making
+`loom-promise` agnostic to concurrency models."
+  :group 'loom)
+
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Struct Definitions
+;;; 3. Struct Definitions
 
 (cl-defstruct (loom-promise (:constructor %%make-promise) (:copier nil))
-  "Represents an asynchronous operation that can resolve or reject.
-This is the central data structure of the library. Its fields should **never**
-be manipulated directly. Use the public API functions (`loom:resolve`,
-`loom:reject`, `loom:status`, etc.) to interact with it.
+  "Represents an asynchronous computation that may complete with a value or error.
+
+A promise encapsulates the eventual result of an asynchronous operation and
+provides a thread-safe interface for handling completion. Promises transition
+through states (`:pending` → `:resolved` / `:rejected`) and maintain callback
+chains for composition and error handling.
+
+IMPORTANT: All fields are implementation details and must not be accessed
+directly. Use the public API functions (`loom:promise-resolve`, `loom:promise-reject`,
+`loom:then`, `loom:promise-status`, etc.) for all interactions.
 
 Fields:
-- `id` (symbol): A unique identifier (`gensym`) for logging and debugging.
-- `result` (any): The value the promise resolved with. Only set if `state`
-  is `:resolved`.
-- `error` (loom-error or nil): The structured error the promise was
-  rejected with.
-- `state` (symbol): The current state of the promise: `:pending`, `:resolved`,
-  or `:rejected`.
-- `callbacks` (list): A list of `loom-callback-link` structs to be executed
-  upon settlement.
-- `cancel-token` (satisfies loom-cancel-token-p, optional): A token to signal
-  cancellation.
-- `cancelled-p` (boolean): Set to `t` if rejection was specifically due to
-  cancellation.
-- `proc` (process or nil): An associated external process, if any
-  (`:process` mode).
-- `lock` (loom-lock): A mutex protecting the promise's fields from concurrent
-  access.
-- `mode` (symbol): Concurrency mode (`:deferred`, `:thread`, or `:process`).
-- `tags` (list): A list of user-defined keywords for categorization and
-  filtering.
-- `created-at` (float): The timestamp (`float-time`) when the promise was
-  created."
+- `id` (symbol): Unique identifier for debugging and introspection.
+- `result` (any): The resolved value, valid only when `state` is `:resolved`.
+- `error` (loom-error or nil): A structured rejection cause, valid only when
+  `state` is `:rejected`. Always a `loom-error` struct.
+- `state` (symbol): Current lifecycle phase (`:pending`, `:resolved`, `:rejected`).
+  A promise's state is immutable once settled.
+- `callbacks` (list): A list of pending `loom-callback-link` objects,
+  representing chained `.then`, `.catch`, `.finally` operations,
+  await latches, etc. These await the promise's settlement.
+- `cancel-token` (satisfies loom-cancel-token-p): An optional cancellation
+  signal interface (`loom-cancel-token` from `loom-cancel.el`).
+- `cancelled-p` (boolean): `t` if this promise was rejected specifically
+  due to a cancellation signal (via `loom:promise-cancel`).
+- `proc` (process or nil): Associated external process for `:process` mode
+  operations. (Managed by external modules like `warp`).
+- `lock` (loom-lock): A mutex protecting critical sections (like state
+  transitions and callback list manipulation) to ensure thread-safe
+  modifications in concurrent environments.
+- `mode` (symbol): Execution context (`:deferred`, `:thread`, or `:process`).
+  Indicates the primary concurrency mode associated with the promise's work.
+  (Currently primarily informational; managed by external modules).
+- `tags` (list): User-defined metadata (list of keywords) for categorization
+  and filtering.
+- `created-at` (float): Timestamp (`float-time`) indicating when the
+  promise was created, useful for monitoring and debugging latency."
   (id nil :type symbol)
   (result nil :type t)
   (error nil :type (or null loom-error))
   (state :pending :type (member :pending :resolved :rejected))
-  (callbacks nil :type list)
+  (callbacks nil :type list)        ; list of loom-callback-link
   (cancel-token nil :type (satisfies loom-cancel-token-p))
   (cancelled-p nil :type boolean)
-  (proc nil)
+  (proc nil :type (or null process)) ; Associated external process (managed by external layer)
   (lock nil :type loom-lock)
   (mode :deferred :type (member :deferred :thread :process))
-  (tags nil :type (or null list))
+  (tags nil :type list)             ; list of keywords
   (created-at (float-time) :type float))
 
 (cl-defstruct (loom-callback-link
                (:constructor %%make-callback-link) (:copier nil))
-  "Groups related callbacks that are attached to a promise as a single unit.
-This struct ensures that a set of callbacks originating from a single
-call like `.then(on-resolve, on-reject)` are processed coherently and
-their corresponding child promise is correctly tracked for unhandled
-rejection detection."
+  "Associates related callbacks with their originating promise chain operation.
+
+Callback links maintain the atomicity of multi-callback operations (such as
+`.then(on-resolve, on-reject)`) by grouping callbacks that must be processed
+together. This ensures proper promise chain semantics and enables accurate
+unhandled rejection tracking by associating callbacks with their downstream
+promises.
+
+Each link represents a single logical step in a promise chain, even when
+that step involves multiple callback functions for different settlement types.
+
+Fields:
+- `id` (symbol): Unique identifier for debugging and introspection.
+- `callbacks` (list): List of `loom-callback` structs to be executed together
+  when the originating promise settles."
   (id nil :type symbol)
-  (callbacks nil :type list))
+  (callbacks nil :type list)) ; list of loom-callback structs
 
 (cl-defstruct (loom-await-latch
                (:constructor %%make-await-latch) (:copier nil))
-  "An internal, thread-safe latch for the `loom:await` mechanism.
-This struct acts as a shared flag between a waiting `loom:await` call
-and the promise it is waiting on. The promise callback signals completion
-by setting `signaled-p` to `t`, while a timeout timer may set it to `'timeout`.
+  "Thread-safe synchronization primitive for cooperative `await` operations.
+
+Provides a coordination mechanism between a cooperative `loom:await` call
+and the asynchronous promise it waits upon. The promise's completion callback
+signals the waiting context by updating the latch state, while timeout
+mechanisms can signal expiration.
+
+The latch supports three states:
+- `nil`: Initial state, awaiting signal.
+- `t`: Signaled by successful promise settlement.
+- `timeout`: Signaled by timeout expiration.
+
+All state transitions are protected by the internal `loom-lock` to ensure
+thread-safe coordination in concurrent environments.
 
 Fields:
-- `signaled-p` (`t`, `nil`, or `'timeout`): The flag indicating completion
-  status.
-- `lock` (loom-lock): A mutex protecting concurrent access to the
-  `signaled-p` field."
-  (signaled-p nil :type (or boolean symbol))
+- `signaled-p` (member nil t timeout): Current signal state - `nil` for
+  awaiting, `t` for successful settlement, `timeout` for expiration.
+- `lock` (loom-lock): Mutex protecting concurrent access to `signaled-p`."
+  (signaled-p nil :type (member nil t timeout))
   (lock nil :type loom-lock))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Internal Core Promise Lifecycle
+;;; 4. Internal Core Promise Lifecycle Helpers (`loom--promise-*`)
 
-(defun loom--promise-execute-executor (promise executor)
-  "Internal helper to safely run a promise's executor function.
-It wraps the execution in a `condition-case` so that if the executor
-function itself throws a synchronous error, the newly created promise is
-immediately rejected with that error.
+(defun loom--promise-should-dispatch-async-p ()
+  "Checks if an asynchronous operation (like promise settlement) should be
+dispatched to the main Emacs thread.
 
-Arguments:
-- `PROMISE` (loom-promise): The new promise being constructed.
-- `EXECUTOR` (function): The user-provided executor `(lambda (resolve reject) ...)`
-
-Returns: `nil`.
-
-Spec References:
-- [Promise/A+ 2.1]: The `executor` is passed `resolve` and `reject` functions.
-- [Promise/A+ 2.1.1.4]: `executor` may throw an error."
-  (let ((id (loom-promise-id promise)))
-    (loom-log :debug id "Executing promise executor function.")
-    (cl-letf (((symbol-value 'loom-current-async-stack)
-               (cons (format "Executor (%S)" id) loom-current-async-stack)))
-      (condition-case err
-          ;; Call the executor with the resolve/reject functions bound to this
-          ;; promise.
-          (funcall executor
-                   (lambda (v) (loom:resolve promise v))
-                   (lambda (e) (loom:reject promise e)))
-        ;; If the executor itself throws an error...
-        (error
-         (let ((msg (format "Promise executor function failed synchronously: %s"
-                            (error-message-string err))))
-           (loom-log :error id "%s" msg)
-           ;; ...reject the promise with that error.
-           (loom:reject promise (loom:make-error :type :executor-error
-                                                 :message msg :cause err))))))))
-
-(defun loom--trigger-callbacks-after-settle (promise callback-links)
-  "Schedules a promise's callbacks for execution after it has settled.
-This function is central to Loom's asynchronous model. It guarantees that
-callbacks are executed on a clean stack, separate from the code that
-originally settled the promise. This adheres to the Promise/A+ spec and
-prevents unexpected re-entrancy issues.
-
-Arguments:
-- `PROMISE` (loom-promise): The promise that has just settled.
-- `CALLBACK-LINKS` (list): A list of `loom-callback-link` objects containing
-  the callbacks to run.
-
-Returns: `nil`."
-  (let* ((id (loom-promise-id promise))
-         (all-callbacks (-flatten (mapcar #'loom-callback-link-callbacks
-                                          callback-links)))
-         (state (loom-promise-state promise))
-         (type-to-run (if (eq state :resolved) :resolved :rejected)))
-    (loom-log :debug id "Scheduling callbacks for settled promise (state: %S)."
-              state)
-
-    ;; Filter the callbacks to run only those matching the settlement state,
-    ;; plus universal handlers like `:finally` and `:await-latch`.
-    (let ((callbacks-to-run
-           (-filter (lambda (cb)
-                      (let ((type (loom-callback-type cb)))
-                        (or (eq type type-to-run)
-                            (memq type '(:await-latch :finally)))))
-                    all-callbacks)))
-      (loom-log :debug id "Found %d relevant callbacks to schedule."
-                (length callbacks-to-run))
-      ;; Separate callbacks into high-priority microtasks and regular macrotasks.
-      (let ((microtasks '()) (macrotasks '()))
-        (dolist (cb callbacks-to-run)
-          ;; `:await-latch` and resolution callbacks run as microtasks for
-          ;; responsiveness.
-          (if (memq (loom-callback-type cb)
-                    '(:await-latch :resolved :rejected :finally))
-              (push cb microtasks)
-            (push cb macrotasks)))
-        ;; Schedule the tasks. `nreverse` is used because we `push`ed them.
-        (when microtasks
-          (dolist (task (nreverse microtasks)) (loom:microtask task)))
-        (when macrotasks
-          (dolist (task (nreverse macrotasks)) (loom:deferred task))))))
-
-  ;; After any rejection, schedule a deferred check to see if the rejection
-  ;; was handled. It's deferred to give user code a chance to attach a `.catch`.
-  (when (eq (loom-promise-state promise) :rejected)
-    (loom-log :debug (loom-promise-id promise)
-              "Scheduling unhandled rejection check for next tick.")
-    (loom:deferred (lambda () (loom--handle-unhandled-rejection promise)))))
-
-(defun loom--kill-associated-process (promise)
-  "Terminates any external OS process associated with a `PROMISE`.
-This is typically called when a promise is cancelled to ensure no orphaned
-processes are left running. This function is idempotent.
-
-Arguments:
-- `PROMISE` (loom-promise): The promise whose process should be killed.
-
-Returns: `nil`."
-  (when-let ((proc (loom-promise-proc promise)))
-    (when (process-live-p proc)
-      (loom-log :info (loom-promise-id promise)
-                "Killing associated process: %S" proc)
-      (ignore-errors (delete-process proc)))
-    ;; Clear the field to prevent multiple kill attempts.
-    (setf (loom-promise-proc promise) nil)))
-
-(defun loom--schedule-or-dispatch-callbacks (promise
-                                             callbacks-to-run
-                                             is-cancellation)
-  "Schedules callbacks for execution, now exclusively on the main thread.
-The logic in `loom--settle-promise` ensures that any attempt to settle a
-promise from a background thread is delegated to the main thread via IPC.
-As a result, this function is only ever called on the main thread, greatly
-simplifying the logic for asynchronous callback execution.
-
-Arguments:
-- `PROMISE` (loom-promise): The settled promise.
-- `CALLBACKS-TO-RUN` (list): The list of `loom-callback-link`s to execute.
-- `IS-CANCELLATION` (boolean): Whether the settlement was due to cancellation.
-
-Returns: `nil`."
-  (let ((id (loom-promise-id promise)))
-    ;; All settlements are now funneled to the main thread, so we can directly
-    ;; trigger the async callback scheduler.
-    (loom-log :debug id "On main thread, triggering callback scheduling.")
-    (loom--trigger-callbacks-after-settle promise callbacks-to-run)
-    ;; If the promise was cancelled, also clean up any associated resources.
-    (when is-cancellation (loom--kill-associated-process promise))))
-
-(defun loom--settle-promise (promise result error is-cancellation)
-  "Settles a `PROMISE` to a resolved or rejected state.
-This is the **core internal settlement function**. It is thread-safe and
-idempotent, meaning it can be called multiple times but will only change the
-promise's state once (from `:pending`).
-
-A key design choice is implemented here: if this function is called from a
-background thread for a `:thread` promise, it does **not** settle the promise
-directly. Instead, it dispatches a message via `loom-ipc` for the main
-thread to perform the settlement. This centralizes all state transitions on
-the main thread, eliminating a large class of potential race conditions.
-
-Arguments:
-- `PROMISE` (loom-promise): The promise to settle.
-- `RESULT` (any): The resolution value (should be `nil` if rejecting).
-- `ERROR` (loom-error): The rejection reason (should be `nil` if resolving).
-- `IS-CANCELLATION` (boolean): `t` if this rejection is a cancellation.
-
-Returns: The original `PROMISE`."
-  (cl-block loom--settle-promise
-    (unless (loom-promise-p promise)
-      (error "Expected loom-promise, got: %S" promise))
-
-    ;; **CRITICAL SECTION: Thread-Safety Delegation**
-    ;; If we are in a background thread and the promise is a `:thread` promise,
-    ;; we delegate the actual settlement to the main thread via IPC.
-    ;; Process-mode promises are already handled on the main thread by the IPC
-    ;; filter.
-    (when (and (eq (loom-promise-mode promise) :thread)
-               (fboundp 'make-thread)
-               (not (equal (current-thread) main-thread)))
-      (let* ((id (loom-promise-id promise))
-             (payload-data (if error `(:error ,error) `(:value ,result))))
-        (loom-log :debug id
-                  "In background thread; dispatching settlement to main thread.")
-        (loom:dispatch-to-main-thread promise :promise-settled payload-data))
-      ;; Immediately return the promise. The actual settlement will happen
-      ;; later on the main thread, which will re-enter this function.
-      (cl-return-from loom--settle-promise promise))
-
-    ;; **MAIN THREAD SETTLEMENT LOGIC**
-    ;; This code path is now only executed on the main thread.
-    (let (settled-now callbacks-to-run (id (loom-promise-id promise)))
-      (loom-log :debug id "Attempting to settle promise on main thread.")
-      (loom:with-mutex! (loom-promise-lock promise)
-        ;; This `when` block ensures the promise only transitions from :pending once.
-        (when (eq (loom-promise-state promise) :pending)
-          (setq settled-now t)
-          (let ((new-state (if error :rejected :resolved)))
-            (loom-log :info id "State transition: :pending -> %S" new-state)
-            (setf (loom-promise-result promise) result
-                  (loom-promise-error promise) error
-                  (loom-promise-state promise) new-state
-                  (loom-promise-cancelled-p promise) is-cancellation))
-          ;; Atomically retrieve all queued callbacks and clear the list.
-          (setq callbacks-to-run (nreverse (loom-promise-callbacks promise)))
-          (setf (loom-promise-callbacks promise) nil)))
-
-      ;; If we were the ones to settle the promise *just now*...
-      (when settled-now
-        (loom-log :debug id "Promise successfully settled. Dispatching callbacks.")
-        ;; Handlers must run asynchronously. This schedules them.
-        (loom--schedule-or-dispatch-callbacks
-         promise callbacks-to-run is-cancellation)
-        (loom-registry-update-promise-state promise)))
-    promise))
-
-(defun loom--handle-unhandled-rejection (promise)
-  "Handles a promise that was rejected without any attached error handlers.
-This function is scheduled on the next scheduler tick *after* a rejection
-occurs. This delay is crucial as it gives user code a chance to attach a
-`.catch` or `.then(nil, on-reject)` handler before the rejection is
-officially flagged as 'unhandled'.
-
-Arguments:
-- `PROMISE` (loom-promise): The rejected promise to check.
-
-Returns: `nil`.
-
-Signals:
-- `loom-unhandled-rejection` if `loom-on-unhandled-rejection-action`
-  is `'signal`."
-  (let ((id (loom-promise-id promise)))
-    (loom-log :debug id "Checking for unhandled rejection.")
-    ;; Check if the promise is still rejected and if the registry confirms
-    ;; that no downstream promise has an error handler.
-    (when (and (eq (loom-promise-state promise) :rejected)
-               (not (loom-registry-has-downstream-handlers-p promise)))
-      (loom-log :warn id "Detected unhandled promise rejection!")
-      (let ((error-obj (loom:error-value promise)))
-        (condition-case err
-            (pcase loom-on-unhandled-rejection-action
-              ('log
-               (loom-log :warn id "Unhandled Rejection: %S" error-obj))
-              ('signal
-               (signal 'loom-unhandled-rejection (list error-obj)))
-              ((pred functionp)
-               (funcall loom-on-unhandled-rejection-action error-obj)))
-          (error
-           (loom-log :error id
-                     "Error occurred within custom unhandled rejection handler: %S"
-                     err)))))))
-
-(defun loom--setup-await-latch (promise timeout)
-  "Creates and attaches a latch to a promise for use with `loom:await`.
-This helper encapsulates the logic of creating a thread-safe latch,
-attaching it to the promise as a high-priority callback, and setting up an
-optional timeout timer that will \"race\" against the promise's settlement.
-
-Arguments:
-- `PROMISE` (loom-promise): The promise to be awaited.
-- `TIMEOUT` (number or nil): The timeout duration in seconds.
+This function consults the `loom-promise-async-dispatch-predicate-functions`
+hook. It iterates through the functions on this hook, and if any function
+returns non-nil, this indicates that special async dispatch is required
+(e.g., when a background thread or worker process attempts to settle
+a promise, requiring the actual state change to occur on the main thread).
 
 Returns:
-- (cons LATCH . TIMER): A cons cell where `LATCH` is a `loom-await-latch`
-  and `TIMER` is a timer object (or nil if no timeout)."
-  (let* ((id (loom-promise-id promise))
-         (latch (%%make-await-latch :lock (loom:lock (format "latch-%S" id))))
-         timer)
-    ;; Attach a high-priority callback that will signal the latch upon settlement.
-    ;; This callback simply flips the `signaled-p` flag to `t`.
-    (loom-attach-callbacks
-     promise
-     (loom:callback (lambda ()
-                      (loom:with-mutex! (loom-await-latch-lock latch)
-                        (setf (loom-await-latch-signaled-p latch) t)))
-                    :type :await-latch
-                    :priority 0 ;; Highest priority
-                    :promise-id id
-                    :source-promise-id id))
-    ;; If a timeout is specified, create a timer that will race the promise.
-    (when timeout
-      (setq timer
-            (run-at-time timeout nil
-                         (lambda ()
-                           (loom:with-mutex! (loom-await-latch-lock latch)
-                             ;; Only set the state to 'timeout if the promise
-                             ;; hasn't already signaled completion.
-                             (unless (loom-await-latch-signaled-p latch)
-                               (loom-log :warn id "Await latch timed out.")
-                               (setf (loom-await-latch-signaled-p latch)
-                                     'timeout)))))))
-    (cons latch timer)))
+- `t` if dispatch to the main thread is needed, `nil` otherwise.
 
-(defun loom--await-cooperative-blocking (promise timeout)
-  "Cooperatively 'blocks' on the main thread until a promise settles.
-This is the implementation of `loom:await`. It uses `loom:poll-with-backoff`
-which repeatedly calls `sit-for` and runs the Loom scheduler. This keeps
-the UI and other background tasks responsive while waiting. For promises
-running in background threads, it also explicitly calls `thread-yield`.
+Side Effects:
+- Calls functions on `loom-promise-async-dispatch-predicate-functions`."
+  (cl-some (lambda (fn) (funcall fn))
+           loom-promise-async-dispatch-predicate-functions))
+
+(defun loom--promise-kill-associated-process (promise)
+  "Terminates any external OS process associated with a promise.
+
+This function provides cleanup functionality for promises that explicitly
+manage external operating system processes (e.g., in `:process` mode).
+It is typically called during promise cancellation or rejection cleanup
+to ensure no orphaned processes remain running after the promise is abandoned.
+
+This function is idempotent: it can be safely called multiple times on the
+same promise without harmful effects. Subsequent calls will be no-ops once
+the process reference has been cleared from the promise object.
 
 Arguments:
-- `PROMISE` (loom-promise): The promise to wait for.
-- `TIMEOUT` (number or nil): The timeout duration in seconds.
+- `PROMISE` (loom-promise): A `loom-promise` object that may have an
+  associated OS process in its `proc` slot.
 
-Returns: The resolved value of the promise.
-Signals: `loom-timeout-error` or `loom-await-error` on failure."
+Returns:
+- `nil`.
+
+Side Effects:
+- May kill an Emacs process if `loom-promise-proc` is set and live.
+- Clears the `loom-promise-proc` slot."
+  (when-let ((process (loom-promise-proc promise)))
+    (when (process-live-p process)
+      (loom:log! :info (loom-promise-id promise)
+                "Terminating associated process: %S" process)
+      (ignore-errors (delete-process process)))
+
+    ;; Clear reference to prevent multiple termination attempts
+    (setf (loom-promise-proc promise) nil)))
+
+(defun loom--promise-trigger-callbacks-after-settle (promise callback-links)
+  "Schedules callbacks for execution after promise settlement.
+
+This is the central orchestrator for callback execution after a promise has
+transitioned from `:pending` to `:resolved` or `:rejected`. It ensures
+callbacks execute on a clean stack, adhering to Promise/A+ specification
+requirements for asynchronous execution.
+
+The function extracts callbacks from `callback-links`, filters them by
+settlement state, prioritizes them as microtasks or macrotasks, and
+schedules them for execution using `loom:microtask` and `loom:deferred`.
+It also schedules an unhandled rejection check for rejected promises.
+
+Arguments:
+- `PROMISE` (loom-promise): A settled `loom-promise` (must be in
+  `:resolved` or `:rejected` state).
+- `CALLBACK-LINKS` (list): A list of `loom-callback-link` objects containing
+  the associated callbacks that were attached to the promise.
+
+Returns: `nil`.
+
+Side Effects:
+- Enqueues tasks into Loom's microtask and macrotask schedulers.
+- Schedules unhandled rejection checks for rejected promises."
+  (let* ((promise-id (loom-promise-id promise))
+         (promise-state (loom-promise-state promise))
+         ;; Flatten the list of lists of callbacks into a single list
+         (all-callbacks (-flatten (mapcar #'loom-callback-link-callbacks
+                                          callback-links)))
+         (target-type (if (eq promise-state :resolved) :resolved :rejected)))
+
+    (loom:log! :debug promise-id
+              "Scheduling callbacks for settled promise (state: %S)"
+              promise-state)
+
+    ;; Filter callbacks to include those matching the promise's settlement
+    ;; state (resolved/rejected) plus universal handlers (`:await-latch`,
+    ;; `:finally`).
+    (let ((relevant-callbacks
+           (-filter (lambda (callback)
+                      (let ((callback-type (loom-callback-type callback)))
+                        (or (eq callback-type target-type)
+                            (memq callback-type '(:await-latch :finally)))))
+                    all-callbacks)))
+
+      (loom:log! :debug promise-id
+                "Found %d relevant callbacks to schedule"
+                (length relevant-callbacks))
+
+      ;; Separate relevant callbacks into high-priority microtasks and
+      ;; standard-priority macrotasks, then schedule them.
+      (let ((microtasks '())
+            (macrotasks '()))
+
+        (dolist (callback relevant-callbacks)
+          (if (memq (loom-callback-type callback)
+                    '(:await-latch :resolved :rejected :finally))
+              (push callback microtasks)
+            (push callback macrotasks)))
+
+        ;; Schedule microtasks (reversed for FIFO)
+        (when microtasks
+          (dolist (task (nreverse microtasks))
+            (loom:microtask task)))
+        ;; Schedule macrotasks (reversed for FIFO)
+        (when macrotasks
+          (dolist (task (nreverse macrotasks))
+            (loom:deferred task)))))
+
+    ;; If the promise was rejected, schedule a check for unhandled rejections.
+    ;; This allows a brief grace period for `.catch` handlers to be attached.
+    (when (eq promise-state :rejected)
+      (loom:log! :debug promise-id
+                "Scheduling unhandled rejection check for next tick")
+      (loom:deferred (lambda ()
+                       (loom--promise-handle-unhandled-rejection promise))))))
+
+(defun loom--promise-settle (promise result error is-cancellation)
+  "Settles `PROMISE` to `:resolved` or `:rejected` state in a thread-safe manner.
+
+This is the core internal settlement function that handles state transitions
+for promises. It enforces idempotency (a promise can only be settled once).
+
+Crucially, it implements a **main-thread-only settlement guarantee**. If called
+from a background thread or a worker process (as determined by
+`loom--promise-should-dispatch-async-p`), it defers the actual state
+change to the main Emacs thread via `loom:deferred`. This centralizes all
+promise state changes, eliminating race conditions when multiple threads/
+processes might attempt to settle the same promise.
+
+Implements Promise/A+ specification section 2.1 (Promise States):
+- A promise must be in one of three states: pending, fulfilled, or rejected
+- State transitions are immutable: pending → fulfilled OR pending → rejected
+- Once settled, a promise's state and value/reason must not change
+
+Arguments:
+- `PROMISE` (loom-promise): The `loom-promise` object to settle.
+- `RESULT` (any): The resolution value (used when `error` is `nil`).
+- `ERROR` (loom-error or nil): The rejection reason (used when `result` is `nil`).
+- `IS-CANCELLATION` (boolean): `t` if this rejection is due to an explicit
+  cancellation, `nil` otherwise.
+
+Returns:
+- (loom-promise): The original `PROMISE` argument, now settled.
+
+Side Effects:
+- Changes `PROMISE`'s state, result, and error fields.
+- Triggers cleanup (`loom--promise-kill-associated-process`) if cancelled.
+- Schedules callbacks for execution."
+  (unless (loom-promise-p promise)
+    (error "Expected loom-promise, got: %S" promise))
+
+  (let ((id (loom-promise-id promise)))
+    ;; If we are not on the main Emacs thread (as determined by external
+    ;; predicates), we MUST delegate the actual state change to the main
+    ;; thread to ensure thread safety and sequential processing.
+    (if (loom--promise-should-dispatch-async-p)
+        (let ((payload (if error `(:error ,error) `(:value ,result))))
+          (loom:log! :debug id "Deferring promise settlement to main thread")
+          (loom:deferred
+           (lambda ()
+             ;; When this deferred task runs on the main thread,
+             ;; it calls the settlement logic again.
+             (loom--promise-settle promise result error is-cancellation))))
+      ;; This block executes ONLY on the main Emacs thread.
+      (loom:log! :debug id "Attempting to settle promise on main thread")
+      (let (settled-now callbacks-to-run)
+        ;; Perform the atomic state transition within a mutex to prevent
+        ;; race conditions from multiple concurrent settlement attempts.
+        (loom:with-mutex! (loom-promise-lock promise)
+          (when (eq (loom-promise-state promise) :pending)
+            (setq settled-now t)
+            (let ((new-state (if error :rejected :resolved)))
+              (loom:log! :info id "State: :pending -> %S" new-state)
+              (setf (loom-promise-result promise) result
+                    (loom-promise-error promise) error
+                    (loom-promise-state promise) new-state
+                    (loom-promise-cancelled-p promise) is-cancellation))
+            ;; Capture callbacks and clear the promise's callback queue atomically.
+            (setq callbacks-to-run (nreverse (loom-promise-callbacks promise)))
+            (setf (loom-promise-callbacks promise) nil)))
+
+        ;; If we successfully performed the settlement in this call (i.e.,
+        ;; the promise was pending and is now changing state), then
+        ;; execute the post-settlement tasks.
+        (when settled-now
+          (loom:log! :debug id "Settlement complete, dispatching callbacks")
+          (loom--promise-trigger-callbacks-after-settle promise
+                                                        callbacks-to-run)
+          ;; Clean up resources if promise was cancelled.
+          (when is-cancellation
+            (loom--promise-kill-associated-process promise))
+          ;; Update registry (e.g., remove from active list for resolved/rejected)
+          (loom-registry-update-promise-state promise)))))
+  promise)
+
+(defun loom--promise-handle-unhandled-rejection (promise)
+  "Checks for and handles unhandled promise rejection.
+
+This function is scheduled to run on the next scheduler tick after a
+promise has been rejected. This delay allows user code a brief grace
+period to attach error handlers (`.catch` or `.finally`). If the
+promise remains rejected without any downstream error handlers,
+this function triggers the configured unhandled rejection action.
+
+Related to Promise/A+ specification section 2.2.1 (onFulfilled and onRejected):
+- Provides a grace period for attaching rejection handlers after settlement.
+- Follows the pattern that handlers can be attached at any time.
+- Ensures unhandled rejections are properly surfaced to the application
+  based on `loom-on-unhandled-rejection-action` customization.
+
+Arguments:
+- `PROMISE` (loom-promise): The rejected `loom-promise` to check.
+
+Returns: `nil`.
+
+Side Effects:
+- May log a warning, signal an error (`loom-unhandled-rejection`),
+  or call a custom function based on `loom-on-unhandled-rejection-action`.
+- Acquires a lock on the promise registry to check for handlers."
+  (let ((id (loom-promise-id promise)))
+    (loom:log! :debug id "Checking for unhandled rejection")
+
+    ;; Only handle if the promise is still in the `:rejected` state and
+    ;; there are no downstream handlers attached in the registry.
+    (when (and (eq (loom-promise-state promise) :rejected)
+               (not (loom-registry-has-downstream-handlers-p promise)))
+      (loom:log! :warn id "Unhandled promise rejection detected")
+
+      (let ((error-obj (loom:promise-error-value promise)))
+        (condition-case handler-error
+            (pcase loom-on-unhandled-rejection-action
+              ('log
+               (loom:log! :warn id "Unhandled Rejection: %S" error-obj))
+              ('signal
+               ;; Signal a distinct error for unhandled rejections.
+               (signal 'loom-unhandled-rejection (list error-obj)))
+              ((pred functionp)
+               ;; Call a custom handler function if provided.
+               (funcall loom-on-unhandled-rejection-action error-obj)))
+          (error
+           (loom:log! :error id "Unhandled rejection handler failed: %S"
+                     handler-error)))))))
+
+(defun loom--promise-setup-await-latch (promise &optional timeout)
+  "Creates and configures an await latch for `PROMISE` with optional `TIMEOUT`.
+
+This function sets up the synchronization mechanism used by `loom:await`.
+It creates a thread-safe `loom-await-latch`, attaches it as a
+high-priority callback to the promise, and optionally sets up an Emacs
+timer that races against promise settlement.
+
+Implements Promise/A+ specification section 2.2.6 (Multiple then calls):
+- Callbacks must execute in the order of their originating calls to then.
+- Uses priority 0 for the await latch callback to ensure it's signaled
+  before most user callbacks, enabling efficient blocking.
+- Maintains callback execution order guarantees even during `await` calls.
+
+Arguments:
+- `PROMISE` (loom-promise): The `loom-promise` to await.
+- `TIMEOUT` (number, optional): Optional timeout duration in seconds.
+  If the promise doesn't settle within this duration, the latch will
+  signal a timeout.
+
+Returns:
+- (cons `loom-await-latch` `timer`): A cons cell where `CAR` is the
+  `loom-await-latch` instance and `CDR` is the Emacs timer object
+  (or `nil` if no timeout was specified). The timer is for timeout
+  tracking.
+
+Side Effects:
+- Attaches a `loom-callback` to `PROMISE`.
+- May create an Emacs timer (`run-at-time`)."
   (let* ((id (loom-promise-id promise))
-         (latch-info (loom--setup-await-latch promise timeout))
+         (latch (%%make-await-latch
+                 :lock (loom:lock (format "latch-%S" id))))
+         timer)
+
+    ;; Attach high-priority settlement callback to signal the latch.
+    (loom-attach-callbacks
+     promise
+     (loom:callback
+      (lambda ()
+        (loom:with-mutex! (loom-await-latch-lock latch)
+          ;; Atomically set the latch to `t` (signaled success)
+          (setf (loom-await-latch-signaled-p latch) t)))
+      :type :await-latch
+      :priority 0  ; Highest priority to signal await immediately
+      :promise-id id
+      :source-promise-id id))
+
+    ;; Setup timeout timer if a timeout duration is provided.
+    (when timeout
+      (setq timer
+            (run-at-time
+             timeout nil ; Delay, repeating is nil
+             (lambda ()
+               (loom:with-mutex! (loom-await-latch-lock latch)
+                 ;; If the latch hasn't been signaled by promise settlement,
+                 ;; set its state to `'timeout`.
+                 (unless (loom-await-latch-signaled-p latch)
+                   (loom:log! :warn id "Await operation timed out")
+                   (setf (loom-await-latch-signaled-p latch)
+                         'timeout)))))))
+
+    (cons latch timer)))
+
+(defun loom--promise-await-cooperative-blocking (promise timeout)
+  "Cooperatively waits for `PROMISE` settlement with optional `TIMEOUT`.
+
+This function implements the core cooperative blocking behavior for
+`loom:await`. It repeatedly polls the promise's state while yielding
+control to Emacs's event loop, thus preventing UI freezes.
+
+It leverages `sit-for` to yield and `loom:scheduler-tick` to process
+pending asynchronous tasks, ensuring responsiveness.
+
+Arguments:
+- `PROMISE` (loom-promise): The `loom-promise` object to wait for.
+- `TIMEOUT` (number, optional): The maximum timeout duration in seconds.
+
+Returns:
+- (any): The resolved value of the promise if it settles successfully.
+
+Signals:
+- `loom-timeout-error`: If the specified `TIMEOUT` is exceeded before
+  the promise settles.
+- `loom-await-error`: If the promise is rejected while being awaited.
+  The original rejection `loom-error` is wrapped as the cause of this error.
+- `loom-error`: For any other unexpected errors during the await loop."
+  (let* ((id (loom-promise-id promise))
+         (latch-info (loom--promise-setup-await-latch promise timeout))
          (latch (car latch-info))
          (timer (cdr latch-info))
-         (is-thread-promise (and (eq (loom-promise-mode promise) :thread)
-                                 (fboundp 'thread-yield))))
+         (initial-time (float-time)))
+
     (unwind-protect
         (progn
-          (loom-log :debug id
-                    "Await: Entering cooperative wait loop (timeout: %s)."
+          (loom:log! :debug id "Starting cooperative wait (timeout: %s)"
                     timeout)
-          ;; The polling loop simply waits for the latch to be signaled by
-          ;; either the promise's settlement callback or the timeout timer.
+
+          ;; Poll until latch is signaled by promise settlement or timeout.
           (loom:poll-with-backoff
-           (lambda ()
-             ;; For thread promises, we explicitly yield to give the other
-             ;; thread a chance to run. This is more robust than relying
-             ;; solely on `sit-for`, which may not yield reliably.
-             (when is-thread-promise
-               (thread-yield))
-             (loom-await-latch-signaled-p latch))
+           (lambda () (loom-await-latch-signaled-p latch))
            :work-fn (lambda () (loom:scheduler-tick))
            :poll-interval loom-await-poll-interval
-           :debug-id id)
-          (loom-log :debug id "Await: Exited wait loop.")
+           :debug-id id
+           :timeout (if timeout timeout 9999999) ; loom:poll-with-backoff expects a timeout
+           )
 
-          ;; After the loop exits, check the latch's final state to determine
-          ;; the outcome.
+          (loom:log! :debug id "Await: Exited wait loop.")
+
+          ;; Determine the outcome based on the latch's final state.
           (cond
            ((eq (loom-await-latch-signaled-p latch) 'timeout)
             (signal 'loom-timeout-error
-                    (list (format "Await timed out for %S" id))))
-           ((loom:rejected-p promise)
-            (signal 'loom-await-error (list (loom:error-value promise))))
-           (t (loom:value promise))))
-      ;; Cleanup: This runs regardless of how the block exits. It's crucial
-      ;; to cancel the timer to prevent it from firing after we're done.
-      (when timer (cancel-timer timer)))))
+                    (list (format "Await timed out for %S after %s seconds."
+                                  id timeout))))
+           ((loom:promise-rejected-p promise)
+            (signal 'loom-await-error
+                    (list (loom:promise-error-value promise))))
+           (t
+            (loom:promise-value promise))))
+
+      ;; Always cleanup the timeout timer, if one was created.
+      (when timer
+        (cancel-timer timer)))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Public API (Package Private): Attaching/Executing Callbacks
+;;; 5. Public API (Package Private): Attaching/Executing Callbacks
 
-(defun loom--execute-simple-callback (callback)
-  "Executor for simple, nullary callbacks like `:await-latch` and `:finally`.
-These callbacks do not receive the promise's result as an argument.
-
-Arguments:
-- `CALLBACK` (loom-callback): The callback to execute.
-
-Returns: The result of the callback's handler function."
+(defun loom--promise-execute-simple-callback (callback)
+  "Executes a simple, nullary callback (e.g., `:await-latch`, `:finally`).
+These callbacks do not receive the promise's result as an argument
+and are typically internal or cleanup handlers."
   (funcall (loom-callback-handler-fn callback)))
 
-(defun loom--execute-resolution-callback (callback)
-  "Executor for standard `:resolved` and `:rejected` callbacks.
-These callbacks are part of a promise chain and their execution may settle
-a downstream promise.
+(defun loom--promise-execute-resolution-callback (callback)
+  "Executes a standard `:resolved` or `:rejected` callback.
+These callbacks are part of a promise chain and their execution may
+settle a downstream promise. They receive the source promise's
+resolution value or rejection error as an argument.
 
 Arguments:
 - `CALLBACK` (loom-callback): The callback to execute.
 
-Returns: The result of the callback's handler function.
-Signals: `error` if the source promise for the callback is missing."
+Returns:
+- (any): The result of the callback's handler function.
+
+Signals:
+- `error` if the source promise for the callback is missing (an internal
+  consistency error)."
   (let* ((data (loom-callback-data callback))
          (source-promise-id (plist-get data :source-promise-id))
          (target-promise-id (plist-get data :promise-id))
          (source-promise (loom-registry-get-promise-by-id source-promise-id))
          (target-promise (loom-registry-get-promise-by-id target-promise-id)))
     (unless source-promise
-      (error "Loom internal error: Source promise %S not found in 
-              registry during callback execution"
+      (error (concat "Loom internal error: Source promise %S not found "
+                     "in registry during callback execution.")
              source-promise-id))
-
+    ;; Target promise might be nil if it was garbage collected before callback ran.
     (when target-promise
-      ;; Determine the argument to pass to the handler function:
-      ;; the resolution value for a `:resolved` callback, or the error
+      ;; Determine the argument to pass to the handler function: the
+      ;; resolution value for a `:resolved` callback, or the error
       ;; object for a `:rejected` callback.
-      (let ((arg (if (loom:rejected-p source-promise)
-                     (loom:error-value source-promise)
-                   (loom:value source-promise))))
+      (let ((handler-arg (if (loom:promise-rejected-p source-promise)
+                             (loom:promise-error-value source-promise)
+                           (loom:promise-value source-promise))))
         ;; The handler function itself is responsible for settling the
         ;; target-promise.
-        (funcall (loom-callback-handler-fn callback) target-promise arg)))))
+        (funcall (loom-callback-handler-fn callback)
+                 target-promise handler-arg)))))
 
 (defun loom-execute-callback (callback)
-  "Executes a stored callback, dispatching to the correct helper.
+  "Executes a stored callback, dispatching to the correct helper function.
 This function is the entry point called by the Loom schedulers (`microtask`
 and `deferred`). It wraps the execution in a `condition-case` to catch
-any errors that occur *within* a user-provided callback handler.
+any errors that occur *within* a user-provided callback handler, ensuring
+they are properly propagated as promise rejections.
 
 Arguments:
 - `CALLBACK` (loom-callback): The callback struct to execute.
@@ -561,434 +663,903 @@ Arguments:
 Returns: `nil`.
 
 Side Effects:
-- If the callback handler function itself signals an error, this function
-  catches it and rejects the target promise of the callback."
-  (let ((id (plist-get (loom-callback-data callback) :promise-id))
-        (type (loom-callback-type callback)))
-    (loom-log :debug id "Executing callback of type %S." type)
+- If the callback handler signals an error, this function catches it and
+  rejects the target promise associated with the callback, propagating
+  the failure downstream."
+  (let* ((promise-id (plist-get (loom-callback-data callback) :promise-id))
+         (callback-type (loom-callback-type callback))
+         (handler-fn (loom-callback-handler-fn callback)))
+
+    (loom:log! :debug promise-id "Executing callback of type %S" callback-type)
+
+    (unless (functionp handler-fn)
+      (error "Invalid callback handler function: %S" handler-fn))
+
     (condition-case-unless-debug err
-        (let ((handler-fn (loom-callback-handler-fn callback)))
-          (unless (functionp handler-fn)
-            (error "Invalid callback handler: %S" handler-fn))
-          (pcase type
-            ((or :await-latch :deferred :cancel :finally)
-             (loom--execute-simple-callback callback))
-            ((or :resolved :rejected)
-             (loom--execute-resolution-callback callback))
-            (_ (error "Unknown callback type: %S" type))))
+        (pcase callback-type
+          ;; Simple callbacks that don't pass promise arguments.
+          ((or :await-latch :deferred :cancel :finally)
+           (loom--promise-execute-simple-callback callback))
+          ;; Callbacks that are part of promise chaining and receive values/errors.
+          ((or :resolved :rejected)
+           (loom--promise-execute-resolution-callback callback))
+          (_
+           (error "Unknown callback type: %S" callback-type)))
       ;; If an error occurs inside the user's callback function...
       (error
-       (let ((msg (format "Callback of type %S failed: %s" type
-                          (error-message-string err))))
-         (loom-log :error id "%s" msg)
+       (let ((error-msg (format "Callback of type %S failed: %s"
+                                callback-type
+                                (error-message-string err))))
+         (loom:log! :error promise-id "%s" error-msg)
          ;; ...we must reject the downstream promise to propagate the failure.
-         (when-let ((promise (loom-registry-get-promise-by-id id)))
-           (loom:reject promise (loom:make-error :type :callback-error
-                                                 :message msg :cause err))))))))
+         (when-let ((promise (loom-registry-get-promise-by-id promise-id)))
+           (loom:promise-reject promise
+                        (loom:error! :type :callback-error
+                                         :message error-msg
+                                         :cause err))))))))
 
 (defun loom-attach-callbacks (promise &rest callbacks)
   "Attaches one or more `CALLBACKS` to a `PROMISE`.
-This function implements the core logic of `.then`. If the promise is
-still `:pending`, the callbacks are added to a list to be run later. If
-the promise has *already* settled, the callbacks are scheduled for
-asynchronous execution immediately.
+This function implements the core logic of `Promise.prototype.then()`.
+If the promise is still `:pending`, the callbacks are grouped into a
+`loom-callback-link` and added to the promise's internal list to be run
+later, when the promise settles. If the promise has *already* settled
+(`:resolved` or `:rejected`), the callbacks are scheduled for asynchronous
+execution immediately to conform to the Promise/A+ specification.
 
 Arguments:
 - `PROMISE` (loom-promise): The promise to attach the callbacks to.
-- `CALLBACKS` (list of `loom-callback`): A list of callback structs.
+- `CALLBACKS` (list of `loom-callback`): One or more `loom-callback` structs
+  to be attached.
 
-Returns: The original `PROMISE`."
-  (let* ((id (loom-promise-id promise))
+Returns:
+- (loom-promise): The original `PROMISE` argument.
+
+Side Effects:
+- Modifies `PROMISE`'s `callbacks` list if pending.
+- Enqueues tasks into Loom's schedulers if `PROMISE` is already settled.
+- Acquires a mutex on the promise for thread-safe access."
+  (let* ((promise-id (loom-promise-id promise))
          (non-nil-callbacks (-filter #'identity callbacks)))
     (when non-nil-callbacks
       ;; Group the related callbacks into a single "link" for tracking.
-      (let ((link (%%make-callback-link :id (gensym "link-")
-                                        :callbacks non-nil-callbacks)))
-        (loom-log :debug id "Attaching %d new callback(s)."
+      (let ((callback-link (%%make-callback-link
+                            :id (gensym "link-")
+                            :callbacks non-nil-callbacks)))
+        (loom:log! :debug promise-id "Attaching %d new callback(s)"
                   (length non-nil-callbacks))
+        ;; Ensure atomic state transition and callback management.
         (loom:with-mutex! (loom-promise-lock promise)
           (if (eq (loom-promise-state promise) :pending)
-              ;; If pending, just add the callbacks to the queue.
-              (push link (loom-promise-callbacks promise))
+              ;; If pending, just add the callbacks link to the queue.
+              (push callback-link (loom-promise-callbacks promise))
             ;; If already settled, we can't just run the callbacks now.
             ;; We must schedule them asynchronously to conform to Promise/A+.
-            (loom--trigger-callbacks-after-settle promise (list link)))))))
+            (loom--promise-trigger-callbacks-after-settle
+             promise (list callback-link)))))))
   promise)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Public API: Promise Creation & Management
+;;; 6. Internal Promise Executor Functions (`loom--invoke-executor-safely`)
 
-(defun loom--promise-execute-executor (promise executor)
-  "Internal helper to safely run a promise's executor function.
-It wraps the execution in a `condition-case` so that if the executor
-function itself throws a synchronous error, the newly created promise is
-immediately rejected with that error.
+(defun loom--invoke-executor-safely (promise executor task-args)
+  "Safely invokes a user-provided executor function.
+
+This function is the heart of promise execution, ensuring that the user's
+asynchronous code is called correctly with `resolve` and `reject` functions.
+It wraps the invocation in a `condition-case` to catch any synchronous
+errors thrown by the executor itself, rejecting the promise as per the
+Promise/A+ specification.
 
 Arguments:
-- `PROMISE` (loom-promise): The new promise being constructed.
-- `EXECUTOR` (function): The user-provided executor `(lambda (resolve reject) ...)`
+- `PROMISE` (loom-promise): The promise instance that the executor will settle.
+- `EXECUTOR` (function): The user-provided executor function, typically of the
+  form `(lambda (resolve reject &rest args) ...)`.
+- `TASK-ARGS` (list): A list of additional arguments to pass to the executor
+  function after `resolve` and `reject`.
 
 Returns: `nil`.
 
-Spec References:
-- [Promise/A+ 2.1]: The `executor` is passed `resolve` and `reject` functions.
-- [Promise/A+ 2.1.1.4]: `executor` may throw an error."
+Side Effects:
+- Calls the `EXECUTOR` function.
+- May resolve or reject `PROMISE` based on `EXECUTOR`'s actions or synchronous
+  errors.
+- Dynamically binds `loom-current-async-stack` for improved debugging."
   (let ((id (loom-promise-id promise)))
-    (loom-log :debug id "Executing promise executor function.")
+    (loom:log! :debug id "Invoking promise executor")
+    ;; Dynamically bind the async stack for better debugging of chained calls.
     (cl-letf (((symbol-value 'loom-current-async-stack)
                (cons (format "Executor (%S)" id) loom-current-async-stack)))
       (condition-case err
-          ;; Call the executor with the resolve/reject functions bound to this
-          ;; promise.
-          (funcall executor
-                   (lambda (v) (loom:resolve promise v))
-                   (lambda (e) (loom:reject promise e)))
-        ;; If the executor itself throws an error...
+          ;; The core `apply` call that runs the user's code, passing the
+          ;; settlement functions and any extra arguments.
+          (apply executor
+                 (lambda (value) (loom:promise-resolve promise value))
+                 (lambda (error) (loom:promise-reject promise error))
+                 task-args)
         (error
-         (let ((msg (format "Promise executor function failed synchronously: %s"
-                            (error-message-string err))))
-           (loom-log :error id "%s" msg)
-           ;; ...reject the promise with that error.
-           (loom:reject promise (loom:make-error :type :executor-error
-                                                 :message msg :cause err))))))))
+         (let ((error-msg (format "Executor failed synchronously: %s"
+                                  (error-message-string err))))
+           (loom:log! :error id "%s" error-msg)
+           (loom:promise-reject promise
+                        (loom:error! :type :executor-error
+                                         :message error-msg
+                                         :cause err))))))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; 7. Public API: Promise Creation & Management (`loom:promise`, `loom:promise-resolve`, etc.)
 
 ;;;###autoload
-(cl-defun loom:promise (&key executor (mode :deferred) name
-                             parent-promise cancel-token tags)
-  "Creates a new, pending `loom-promise`. This is the primary constructor.
-If an `:executor` is provided, its execution is handled based on the `:mode`.
+(cl-defun loom:promise (&key executor name cancel-token mode tags)
+  "Creates a new `loom-promise` instance.
 
-- `:deferred`: The executor runs immediately on the current thread.
-- `:thread`: The executor is run in the shared, default thread pool.
-- `:process`: The executor is treated as a Lisp FORM and run in the
-  shared, default multiprocess pool. Because functions cannot be
-  sent to another process, the `resolve` and `reject` arguments
-  are not available in this mode; the form's return value is used
-  to resolve the promise.
+This is the main constructor for promises. A `loom-promise` represents
+an asynchronous operation that will eventually produce a value or an error.
+
+If an `:executor` function is provided, it will be scheduled to run
+asynchronously on the main Emacs event loop (as a microtask). The executor
+receives `resolve` and `reject` functions as its first two arguments,
+which it calls to settle the promise. If no executor is given, the promise
+can be settled manually later via `loom:promise-resolve` or `loom:promise-reject`.
 
 Arguments:
-- `:EXECUTOR` (function or form, optional): The async work to perform.
-  - For `:deferred` and `:thread` modes, this must be a function of the
-    form `(lambda (resolve reject) ...)`.
-  - For `:process` mode, this must be a serializable Lisp form to be
-    evaluated in a worker process.
-- `:MODE` (symbol): Concurrency mode: `:deferred`, `:thread`, or `:process`.
-- `:NAME` (string, optional): A descriptive name for debugging and logging.
-- `:PARENT-PROMISE` (loom-promise, internal): Used by `.then` to link promises.
-- `:CANCEL-TOKEN` (loom-cancel-token, optional): A token for propagating
-  cancellation.
-- `:TAGS` (list, optional): A list of keyword symbols for categorization.
+- `:executor` (function, optional): A function `(lambda (resolve reject))`
+  that performs the asynchronous work. `resolve` and `reject` are functions
+  to settle the promise.
+- `:name` (string, optional): An optional descriptive name for debugging
+  and logging purposes.
+- `:cancel-token` (loom-cancel-token, optional): An optional cancellation
+  token from `loom-cancel.el` for coordinated cancellation across multiple
+  promises. If provided, `loom:promise-cancel` will be called on this promise
+  when the token is triggered.
+- `:mode` (symbol, optional): The execution context associated with the
+  promise's work (`:deferred`, `:thread`, or `:process`). This is primarily
+  informational and used by external modules (like `warp`). Defaults to
+  `:deferred`.
+- `:tags` (list, optional): A list of user-defined keywords for categorization
+  and filtering.
 
-Returns: A new `loom-promise` in the `:pending` state."
-  (let* ((promise-id (gensym (or name "promise-")))
+Returns:
+- (loom-promise): A new `loom-promise` instance, initialized in the
+  `:pending` state.
+
+Side Effects:
+- Registers the promise with the global `loom-registry`.
+- Sets up cancellation callbacks if `:cancel-token` is provided.
+- Schedules the executor on the microtask queue (`loom:microtask`) if provided.
+- Acquires a lock for the promise instance to ensure thread-safety."
+  (let* ((promise-name (or name "<anonymous>"))
+         (promise-id (gensym (format "%s-" promise-name)))
          (promise (%%make-promise
                    :id promise-id
-                   :mode mode
-                   :lock (loom:lock (format "promise-%S" promise-id) :mode mode)
-                   :tags (cl-delete-duplicates (ensure-list tags))
-                   :cancel-token cancel-token)))
-    (loom-log :info promise-id "Created new promise (mode: %s, name: %s)"
-              mode (or name "unset"))
-    (loom-registry-register-promise promise
-                                    :parent-promise parent-promise
-                                    :tags tags)
+                   :lock (loom:lock (format "promise-%S" promise-id))
+                   :cancel-token cancel-token
+                   :mode (or mode :deferred)
+                   :tags (or tags nil))))
+    (loom:log! :info promise-id
+               "Created promise (name: %s, mode: %S)" promise-name (or mode :deferred))
 
-    (when cancel-token
+    ;; Register the promise with the global registry for tracking.
+    (loom-registry-register-promise promise :name promise-name)
+
+    ;; If a cancellation token is provided, add a callback to it so that
+    ;; when the token is triggered, this promise will be cancelled.
+    (when (loom-cancel-token-p cancel-token)
       (loom-cancel-token-add-callback
-       cancel-token (lambda (reason) (loom:cancel promise reason))))
+       cancel-token
+       (lambda (reason)
+         (loom:promise-cancel promise reason))))
 
+    ;; If an executor function is provided, schedule it to run as a microtask.
+    ;; Microtasks ensure the executor runs asynchronously but before other
+    ;; events in the current Emacs event loop tick.
     (when executor
-      (pcase mode
-        (:deferred
-         (loom--promise-execute-executor promise executor))
-        (:thread
-         (unless (fboundp 'make-thread)
-           (error "Emacs does not support threads; cannot use :thread mode"))
-         (loom:thread-pool-submit (loom:thread-pool-default)
-                                  #'loom--promise-execute-executor
-                                  promise
-                                  executor))
-        (:process
-         ;; For process mode, we submit the EXECUTOR form to the multiprocess
-         ;; pool. The returned promise from the pool is then used to settle
-         ;; the promise we just created.
-         (let ((pool-promise (loom:multiprocess! executor)))
-           ;; Link the settlement of the outer promise to the inner pool promise.
-           (loom:then pool-promise
-                      (lambda (result) (loom:resolve promise result))
-                      (lambda (err) (loom:reject promise err)))))
-        (_
-         (error "Unsupported promise mode for executor: %S" mode))))
+      (loom:microtask
+       (lambda ()
+         (loom--invoke-executor-safely promise executor nil))))
     promise))
 
 ;;;###autoload
-(defun loom:resolve (promise value)
-  "Resolves a `PROMISE` with `VALUE`, following the Promise/A+ resolution
-procedure. This operation is idempotent: once a promise is settled, further
-calls to `resolve` or `reject` are ignored.
+(defun loom:promise-resolve (promise value)
+  "Resolves a `PROMISE` with `VALUE` following the Promise/A+ specification.
 
-If `VALUE` is itself a `loom-promise` (or an object normalizable to one),
-`PROMISE` will \"adopt\" its state, eventually settling to the same outcome.
+This operation is idempotent: once a promise is settled (either resolved
+or rejected), further calls to `loom:promise-resolve` or `loom:promise-reject` on that
+same promise instance are silently ignored.
+
+If `VALUE` is itself a `loom-promise` (or can be normalized to one via
+`loom-normalize-awaitable-hook`), the current `PROMISE` will
+\"adopt\" the state of `VALUE`, eventually settling to the
+same outcome.
 
 Arguments:
-- `PROMISE` (loom-promise): The promise to resolve.
-- `VALUE` (any): The value to resolve with.
+- `PROMISE` (loom-promise): The promise instance to resolve. Must be pending.
+- `VALUE` (any): The resolution value, including another promise.
 
-Returns: The original `PROMISE`."
+Returns:
+- The original `PROMISE` argument.
+
+Signals:
+- `loom-type-error`: If `PROMISE` is not a valid `loom-promise` object.
+- `loom-resolution-cycle-error`: If `PROMISE` is resolved with itself.
+
+Side Effects:
+- Changes the promise state from `:pending` to `:resolved` (if not already
+  settled and `VALUE` is not a promise).
+- Executes all attached resolution callbacks asynchronously.
+- May modify other promises if `VALUE` is another promise (adoption).
+- Logs internal state transitions."
   (unless (loom-promise-p promise)
-    (signal 'loom-type-error (list "Expected a promise" promise)))
-  (let ((id (loom-promise-id promise)))
-    (loom-log :debug id "Resolve called with value of type %S." (type-of value))
+    (signal 'loom-type-error
+            (list "Expected a loom-promise object" promise)))
 
-    ;; A promise cannot be resolved with itself.
-    (if (eq promise value)
-        (loom:reject promise (loom:make-error :type :type-error
-                                              :message "Promise resolution cycle detected."))
-      ;; Check if the value is a promise or can be converted to one.
+  (cl-block loom:promise-resolve
+    (let ((promise-id (loom-promise-id promise)))
+      (loom:log! :debug promise-id
+                "Attempting to resolve with value of type %S" (type-of value))
+      ;; Prevent resolution cycles (Promise/A+ requirement 2.3.1)
+      (when (eq promise value)
+        (let ((error (loom:error!
+                      :type :resolution-cycle
+                      :message "A promise cannot be resolved with itself"
+                      :cause promise)))
+          (loom:log! :error promise-id "Resolution cycle detected")
+          (loom:promise-reject promise error)
+          (cl-return-from loom:promise-resolve promise)))
+
+      ;; Handle promise-like values (thenables) (Promise/A+ requirement 2.3.2)
       (let ((normalized-value
-             (if (loom-promise-p value) value
-               (run-hook-with-args-until-success
-                'loom-normalize-awaitable-hook value))))
-        ;; If the value is a promise (a "thenable"), adopt its state.
+            (cond
+              ;; Already a loom-promise
+              ((loom-promise-p value) value)
+              ;; Try to normalize other thenable objects
+              (t (run-hook-with-args-until-success
+                  'loom-normalize-awaitable-hook value)))))
         (if (loom-promise-p normalized-value)
-            (let ((outer-promise promise))
-              (loom-log :info id "Chaining to inner promise %S."
+            ;; Value is a promise - adopt its state
+            (progn
+              (loom:log! :info promise-id
+                        "Chaining to inner promise %S"
                         (loom-promise-id normalized-value))
-              ;; Attach callbacks to the inner promise. When it settles, it
-              ;; will in turn settle this outer promise with the same outcome.
+              ;; Create callbacks to forward the inner promise's settlement
               (loom-attach-callbacks
-               normalized-value
-               (loom:callback (lambda (_ res) (loom:resolve outer-promise res))
-                              :type :resolved
-                              :promise-id id
-                              :source-promise-id
-                              (loom-promise-id normalized-value))
-               (loom:callback (lambda (_ err) (loom:reject outer-promise err))
-                              :type :rejected
-                              :promise-id id
-                              :source-promise-id
-                              (loom-promise-id normalized-value))))
-          ;; If the value is a normal value, fulfill the promise with it.
-          (loom--settle-promise promise value nil nil)))))
+                normalized-value
+                (loom:callback
+                  (lambda (_ resolved-value)
+                    (loom:promise-resolve promise resolved-value))
+                  :type :resolved
+                  :promise-id promise-id
+                  :source-promise-id (loom-promise-id normalized-value))
+                (loom:callback
+                  (lambda (_ rejection-error)
+                    (loom:promise-reject promise rejection-error))
+                  :type :rejected
+                  :promise-id promise-id
+                  :source-promise-id (loom-promise-id normalized-value))))
+          ;; Value is not a promise - fulfill directly
+          (progn
+            (loom:log! :debug promise-id
+                      "Resolving with non-promise value: %S" value)
+            (loom--promise-settle promise value nil nil))))))
   promise)
 
 ;;;###autoload
-(defun loom:reject (promise error)
-  "Rejects `PROMISE` with `ERROR`.
-This operation is idempotent. If the provided `ERROR` is not already a
-`loom-error` struct, it will be wrapped in one automatically.
+(defun loom:promise-reject (promise error)
+  "Rejects a `PROMISE` with `ERROR` as the rejection reason.
+
+This operation is idempotent: once a promise is settled (either resolved
+or rejected), further calls to `loom:promise-resolve` or `loom:promise-reject` on that
+same promise instance are silently ignored.
+
+If `ERROR` is not a `loom-error` struct, it will be automatically wrapped
+in one by `loom:error-wrap` to ensure consistency.
 
 Arguments:
-- `PROMISE` (loom-promise): The promise to reject.
-- `ERROR` (any): The reason for the rejection.
+- `PROMISE` (loom-promise): The promise instance to reject. Must be pending.
+- `ERROR` (any): The rejection reason. This can be any Emacs Lisp object.
 
-Returns: The original `PROMISE`."
+Returns:
+- The original `PROMISE` argument.
+
+Signals:
+- `loom-type-error`: If `PROMISE` is not a valid `loom-promise` object.
+
+Side Effects:
+- Changes the promise state from `:pending` to `:rejected` (if not already
+  settled).
+- Executes all attached rejection callbacks asynchronously.
+- Logs internal state transitions.
+
+Examples:
+  (let ((p (loom:promise)))
+    (loom:promise-reject p \"Something went wrong\")) ; Error string is wrapped
+
+  (let ((p (loom:promise))
+        (err (loom:error! :type :network
+                              :message \"Connection failed\")))
+    (loom:promise-reject p err)) ; Pre-wrapped loom-error is used directly"
   (unless (loom-promise-p promise)
-    (signal 'loom-type-error (list "Expected a promise" promise)))
-  (let ((id (loom-promise-id promise)))
-    (loom-log :debug id "Reject called.")
-    ;; Normalize the error into a standard `loom-error` struct.
-    ;; Check if the rejection is due to a cancellation signal.
-    (let* ((is-cancellation (and (loom-error-p error)
-                                 (eq (loom-error-type error) :cancel)))
-           (final-error (if (loom-error-p error) error
-                          (loom:make-error :type :rejection :cause error))))
-      (loom--settle-promise promise nil final-error is-cancellation)))
+    (signal 'loom-type-error
+            (list "Expected a loom-promise object" promise)))
+
+  (let ((promise-id (loom-promise-id promise)))
+    (loom:log! :debug promise-id
+              "Attempting to reject with error of type %S" (type-of error))
+    ;; Normalize error to a `loom-error` struct.
+    (let* ((normalized-error
+            (if (loom-error-p error)
+                error
+              (loom:error! :type :rejection
+                               :message "Promise rejected"
+                               :cause error)))
+           ;; Determine if this rejection is specifically due to cancellation.
+           (is-cancellation
+            (and (loom-error-p normalized-error)
+                 (eq (loom-error-type normalized-error) :cancel))))
+      (when is-cancellation
+        (loom:log! :info promise-id "Promise rejected due to cancellation"))
+      ;; Perform the actual, idempotent settlement.
+      (loom--promise-settle promise nil normalized-error is-cancellation)))
   promise)
 
 ;;;###autoload
-(defun loom:cancel (promise &optional reason)
-  "Cancels a pending `PROMISE`.
+(defun loom:promise-cancel (promise &optional reason)
+  "Cancels a pending `PROMISE` with an optional `REASON`.
+
 This is a convenience function that rejects the promise with a special
-`:cancel` error type. This allows `.catch` handlers to differentiate
-between cancellations and other failures.
+`:cancel` error type (a `loom-error` with `:type :cancel`). This allows
+`.catch` handlers to differentiate between cancellations and other failures.
+
+Only pending promises can be cancelled. Calling this function on a promise
+that has already been settled (resolved or rejected) has no effect.
 
 Arguments:
-- `PROMISE` (loom-promise): The promise to cancel.
+- `PROMISE` (loom-promise): The promise instance to cancel.
 - `REASON` (string, optional): A descriptive message for the cancellation.
+  If omitted, a default message is used.
 
-Returns: The original `PROMISE`."
-  (when (loom:pending-p promise)
-    (let ((msg (or reason "Promise cancelled without a specific reason.")))
-      (loom-log :info (loom-promise-id promise) "Cancelling. Reason: %s" msg)
-      (loom:reject promise (loom:make-error :type :cancel :message msg))))
+Returns:
+- (loom-promise): The original `PROMISE` argument.
+
+Signals:
+- `loom-type-error`: If `PROMISE` is not a valid `loom-promise` object.
+
+Side Effects:
+- If the promise is pending, its state changes to `:rejected`.
+- Executes all attached rejection callbacks asynchronously.
+- Marks the promise as `cancelled-p` for introspection.
+- Triggers cleanup of any associated external processes (e.g., in `warp`).
+
+Examples:
+  (let ((p (loom:promise)))
+    (loom:promise-cancel p \"user cancelled\")
+    (loom:promise-cancelled-p p))  ; Rejects p with :cancel error
+
+  (loom:promise-cancel my-promise) ; Cancels with default reason"
+  (unless (loom-promise-p promise)
+    (signal 'loom-type-error
+            (list "Expected a loom-promise object" promise)))
+
+  ;; Only attempt to cancel if the promise is still in the `:pending` state.
+  (when (loom:promise-pending-p promise)
+    (let* ((promise-id (loom-promise-id promise))
+           (cancellation-reason
+            (or reason "Promise cancelled without specific reason"))
+           (cancel-error
+            (loom:error! :type :cancel
+                             :message cancellation-reason)))
+      (loom:log! :info promise-id "Cancelling promise. Reason: %s"
+                cancellation-reason)
+      ;; Reject the promise with the cancellation error.
+      (loom:promise-reject promise cancel-error)))
   promise)
 
 ;;;###autoload
 (defmacro loom:resolved! (value-form &rest keys)
-  "Creates and returns a new promise that is already resolved.
+  "Creates and returns a new promise that is immediately resolved.
+
+This macro creates a `loom-promise` and immediately resolves it with the
+result of evaluating `VALUE-FORM`. This is a convenient shorthand for
+creating promises that represent already-completed successful operations.
 
 Arguments:
-- `VALUE-FORM`: A Lisp form that evaluates to the resolution value.
-- `KEYS`: Keyword arguments to pass to `loom:promise` (e.g., `:name`, `:tags`).
+- `VALUE-FORM` (form): A Lisp form that evaluates to the resolution value.
+  This form is evaluated synchronously when the macro expands.
+- `KEYS` (plist): Optional keyword arguments to pass directly to `loom:promise`
+  (e.g., `:name`, `:tags`).
 
-Returns: A new promise in the `:resolved` state."
+Returns:
+- (loom-promise): A new `loom-promise` instance already in the `:resolved`
+  state.
+
+Signals:
+- Any signals originating from `VALUE-FORM`'s evaluation, or from `loom:promise`
+  or `loom:promise-resolve` calls (e.g., `loom-type-error`).
+
+Side Effects:
+- Evaluates `VALUE-FORM` immediately.
+- Creates and registers a new promise with `loom-registry`.
+- The promise's callbacks are scheduled asynchronously (microtasks/macrotasks)."
   (declare (indent 1) (debug t))
   `(let ((promise (apply #'loom:promise (list ,@keys))))
-     (loom:resolve promise ,value-form)))
+     (loom:promise-resolve promise ,value-form)
+     promise)) ; Return the promise after resolution
 
 ;;;###autoload
 (defmacro loom:rejected! (error-form &rest keys)
-  "Creates and returns a new promise that is already rejected.
+  "Creates and returns a new promise that is immediately rejected.
+
+This macro creates a `loom-promise` and immediately rejects it with the
+result of evaluating `ERROR-FORM`. This is a convenient shorthand for
+creating promises that represent already-failed operations.
 
 Arguments:
-- `ERROR-FORM`: A Lisp form that evaluates to the rejection reason.
-- `KEYS`: Keyword arguments to pass to `loom:promise` (e.g., `:name`, `:tags`).
-
-Returns: A new promise in the `:rejected` state."
-  (declare (indent 1) (debug t))
-  `(let ((promise (apply #'loom:promise (list ,@keys))))
-     (loom:reject promise ,error-form)))
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Public API: Promise Status and Introspection
-
-;;;###autoload
-(defun loom:status (promise)
-  "Returns the current state of a `PROMISE` without blocking.
-
-Arguments:
-- `PROMISE` (loom-promise): The promise to inspect.
+- `ERROR-FORM` (form): A Lisp form that evaluates to the rejection reason
+  (an error object or any value that will be wrapped into a `loom-error`).
+  This form is evaluated synchronously when the macro expands.
+- `KEYS` (plist): Optional keyword arguments to pass directly to `loom:promise`
+  (e.g., `:name`, `:tags`).
 
 Returns:
-- (symbol): The state, one of `:pending`, `:resolved`, or `:rejected`.
+- (loom-promise): A new `loom-promise` instance already in the `:rejected`
+  state.
 
-Signals: `loom-type-error` if `PROMISE` is not a `loom-promise`."
+Signals:
+- Any signals originating from `ERROR-FORM`'s evaluation, or from `loom:promise`
+  or `loom:promise-reject` calls (e.g., `loom-type-error`).
+
+Side Effects:
+- Evaluates `ERROR-FORM` immediately.
+- Creates and registers a new promise with `loom-registry`.
+- The promise's callbacks are scheduled asynchronously (microtasks/macrotasks)."
+  (declare (indent 1) (debug t))
+  `(let ((promise (apply #'loom:promise (list ,@keys))))
+     (loom:promise-reject promise ,error-form)
+     promise)) ; Return the promise after rejection
+
+;;;###autoload
+(defun loom:promise-proxy (promise-id)
+  "Creates a lightweight proxy promise representing a remote promise.
+
+This function is used primarily for Inter-Process Communication (IPC)
+scenarios where a local Emacs instance (e.g., a worker process) needs
+to refer to a promise that exists and is managed in another Emacs
+instance (e.g., the master process). The returned object has only the
+`id` field set; it is not a fully managed promise and cannot be resolved
+or rejected locally. Its primary purpose is to be passed around as a
+reference that can be used to coordinate with the remote promise.
+
+Arguments:
+- `PROMISE-ID` (symbol): The unique ID of the remote promise.
+
+Returns:
+- (loom-promise): A lightweight promise object with only its `id`
+  field set, acting as a handle to the remote promise. This object will
+  still pass `loom-promise-p` checks."
+  (%%make-promise :id promise-id))
+
+;;;###autoload
+(defun loom:promise-never (&key name tags)
+  "Returns a promise that will never settle.
+
+This is a useful primitive for creating asynchronous operations or services
+that are intended to run indefinitely without naturally completing or failing.
+A promise returned by this function will always remain in the `:pending` state.
+Such a promise will never trigger its `resolved` or `rejected` callbacks
+unless explicitly resolved or rejected via `loom:promise-resolve` or `loom:promise-reject`
+from external code.
+
+Arguments:
+- `:name` (string, optional): An optional descriptive name for the promise.
+- `:tags` (list, optional): Optional user-defined metadata tags.
+
+Returns:
+- (loom-promise): A new `loom-promise` instance that will always remain
+  in the `:pending` state, unless explicitly settled."
+  ;; We create a promise without an executor and never call resolve/reject on it.
+  (loom:promise :name (or name "never-promise") :tags tags))
+
+;;;###autoload
+(defun loom:promise-on (symbol)
+  "Returns a promise that resolves when `SYMBOL`'s value becomes non-nil.
+
+This function is useful for waiting asynchronously for a global variable
+to be set or assigned a non-nil value by some other part of the system.
+If the `SYMBOL`'s value itself becomes a `loom-promise`, this promise will
+chain to and settle with the outcome of that nested promise.
+
+Arguments:
+- `SYMBOL` (symbol): The symbol (variable name) to observe.
+
+Returns:
+- (loom-promise): A promise that:
+    - Resolves with `(symbol-value SYMBOL)` once it becomes non-nil.
+    - If `(symbol-value SYMBOL)` itself becomes a `loom-promise`, it
+      resolves or rejects with the outcome of that nested promise.
+    - Remains pending until `SYMBOL` is non-nil or (if nested promise)
+      the nested promise settles.
+
+Side Effects:
+- Registers a periodic task with the default `loom-poll` instance to
+  check `SYMBOL`'s value.
+- Cancels this periodic task once the promise settles.
+
+Signals:
+- `error`: If `SYMBOL` is not a valid symbol.
+- `loom-poll-error`: If there's an issue with the underlying polling
+  mechanism."
+  (unless (symbolp symbol)
+    (error "SYMBOL argument must be a symbol, but got %S" symbol))
+
+  (let* ((poll (loom:poll-default)) ; Get the default loom-poll instance
+         (task-id (format "promise-on-task-%S" symbol)))
+    (loom:promise
+     :name (format "promise-on-%S" symbol)
+     :executor
+     (lambda (resolve reject)
+       (labels ((check-value-and-resolve ()
+                  "Checks symbol value and resolves/rejects promise.
+                   Returns t if resolved/rejected, nil otherwise."
+                  (let ((val (symbol-value symbol)))
+                    (when val
+                      ;; Cleanup the polling task as soon as it resolves/rejects
+                      (loom:poll-unregister-periodic-task poll task-id)
+                      (if (loom-promise-p val)
+                          ;; If the value is itself a promise, chain to it
+                          (loom:then val resolve reject)
+                        ;; Otherwise, resolve with the value directly
+                        (funcall resolve val))
+                      t)))) ; Indicate check is complete and task is done
+
+         ;; Immediately check the value once, in case it's already set.
+         (when (check-value-and-resolve)
+           (cl-return-from loom:promise-on-executor-lambda nil)) ; Exit executor if resolved
+
+         ;; If not immediately resolved, register a periodic task to monitor the symbol.
+         (loom:poll-register-periodic-task
+          poll
+          task-id
+          #'check-value-and-resolve))))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; 8. Public API: Promise Status and Introspection (`loom:promise-status`, etc.)
+
+(cl-defun loom:promise-status (promise)
+  "Returns the current settlement state of a `PROMISE` without blocking.
+
+This function provides immediate, non-blocking access to a promise's current
+state. It does not trigger any state changes or side effects, making it safe
+to call repeatedly for monitoring purposes.
+
+Arguments:
+- `PROMISE` (loom-promise): The promise object to inspect.
+
+Returns:
+A symbol representing the current state:
+- `:pending`: The promise has not yet been resolved or rejected.
+- `:resolved`: The promise has been successfully resolved with a value.
+- `:rejected`: The promise has been rejected with an error.
+
+Signals:
+- `loom-type-error`: If `PROMISE` is not a valid `loom-promise` object."
   (unless (loom-promise-p promise)
-    (signal 'loom-type-error (list "Expected a promise" promise)))
+    (signal 'loom-type-error
+            (list "Expected a loom-promise object" promise)))
   (loom-promise-state promise))
 
-;;;###autoload
-(defun loom:pending-p (promise)
-  "Returns non-nil if `PROMISE` is in the `:pending` state.
+(cl-defun loom:promise-pending-p (promise)
+  "Tests whether a `PROMISE` is in the pending state.
+
+A promise is pending when it has been created but has not yet been resolved
+or rejected. Pending promises may still be executing work or waiting for
+external events.
 
 Arguments:
-- `PROMISE` (loom-promise): The promise to inspect.
+- `PROMISE` (loom-promise): The promise object to test.
 
-Returns: `t` if pending, `nil` otherwise."
-  (eq (loom:status promise) :pending))
+Returns:
+- `t` if the promise is currently pending.
+- `nil` if the promise has been settled (resolved or rejected).
 
-;;;###autoload
-(defun loom:resolved-p (promise)
-  "Returns non-nil if `PROMISE` is in the `:resolved` state.
+Signals:
+- `loom-type-error`: If `PROMISE` is not a valid `loom-promise` object
+  (propagated from `loom:promise-status`)."
+  (eq (loom:promise-status promise) :pending))
 
-Arguments:
-- `PROMISE` (loom-promise): The promise to inspect.
+(cl-defun loom:promise-resolved-p (promise)
+  "Tests whether a `PROMISE` has been successfully resolved.
 
-Returns: `t` if resolved, `nil` otherwise."
-  (eq (loom:status promise) :resolved))
-
-;;;###autoload
-(defun loom:rejected-p (promise)
-  "Returns non-nil if `PROMISE` is in the `:rejected` state.
+A promise is resolved when it has been settled with a successful value.
+Resolved promises will not change state again.
 
 Arguments:
-- `PROMISE` (loom-promise): The promise to inspect.
+- `PROMISE` (loom-promise): The promise object to test.
 
-Returns: `t` if rejected, `nil` otherwise."
-  (eq (loom:status promise) :rejected))
+Returns:
+- `t` if the promise has been resolved with a value.
+- `nil` if the promise is pending or has been rejected.
 
-;;;###autoload
-(defun loom:cancelled-p (promise)
-  "Returns non-nil if `PROMISE` was specifically cancelled.
-This is a subset of `loom:rejected-p`.
+Signals:
+- `loom-type-error`: If `PROMISE` is not a valid `loom-promise` object
+  (propagated from `loom:promise-status`)."
+  (eq (loom:promise-status promise) :resolved))
 
-Arguments:
-- `PROMISE` (loom-promise): The promise to inspect.
+(cl-defun loom:promise-rejected-p (promise)
+  "Tests whether a `PROMISE` has been rejected with an error.
 
-Returns: `t` if cancelled, `nil` otherwise."
-  (loom-promise-cancelled-p promise))
-
-;;;###autoload
-(defun loom:value (promise)
-  "Returns the resolved value of `PROMISE`, or `nil` if not resolved.
-This function is non-blocking. If the promise is pending or rejected, it
-returns `nil`.
+A promise is rejected when it has been settled with an error or exception.
+Rejected promises will not change state again. This includes promises that
+were cancelled, as cancellation is implemented as a special type of rejection.
 
 Arguments:
-- `PROMISE` (loom-promise): The promise to inspect.
+- `PROMISE` (loom-promise): The promise object to test.
 
-Returns: The resolved value, or `nil`."
-  (when (loom:resolved-p promise)
+Returns:
+- `t` if the promise has been rejected (including cancellation).
+- `nil` if the promise is pending or has been resolved.
+
+Signals:
+- `loom-type-error`: If `PROMISE` is not a valid `loom-promise` object
+  (propagated from `loom:promise-status`)."
+  (eq (loom:promise-status promise) :rejected))
+
+(cl-defun loom:promise-cancelled-p (promise)
+  "Tests whether a `PROMISE` was specifically cancelled.
+
+This function tests for a specific subset of rejected promises: those that
+were rejected due to an explicit cancellation rather than other types of errors.
+A cancelled promise is always in the `:rejected` state, but a promise in the
+`:rejected` state is not necessarily cancelled (it could have failed for
+other reasons).
+
+Arguments:
+- `PROMISE` (loom-promise): The promise object to test.
+
+Returns:
+- `t` if the promise's state is `:rejected` and its `cancelled-p` flag is `t`.
+- `nil` if the promise is pending, resolved, or rejected for other reasons.
+
+Signals:
+- `loom-type-error`: If `PROMISE` is not a valid `loom-promise` object
+  (propagated from internal promise accessor functions)."
+  (and (loom-promise-p promise)
+       (loom-promise-cancelled-p promise)))
+
+(cl-defun loom:promise-value (promise)
+  "Returns the resolved value of a `PROMISE`, or `nil` if not resolved.
+
+This function provides non-blocking access to a promise's resolution value.
+It only returns a meaningful result for promises that have been successfully
+resolved (`:resolved` state). For pending or rejected promises, it returns `nil`.
+
+Note: Since `nil` is a valid resolution value in Emacs Lisp, use
+`loom:promise-resolved-p` in conjunction with `loom:promise-value` to
+distinguish between a promise resolved with `nil` and a promise that is
+not yet (or never will be) resolved.
+
+Arguments:
+- `PROMISE` (loom-promise): The promise object to inspect.
+
+Returns:
+- (any): The resolved value if the promise is in the `:resolved` state.
+- `nil` if the promise is pending or rejected.
+
+Signals:
+- `loom-type-error`: If `PROMISE` is not a valid `loom-promise` object
+  (propagated from `loom:promise-resolved-p`)."
+  (when (loom:promise-resolved-p promise)
     (loom-promise-result promise)))
 
-;;;###autoload
-(defun loom:error-value (promise)
-  "Returns the rejection error of `PROMISE`, or `nil` if not rejected.
-This function is non-blocking. If the promise is pending or resolved, it
-returns `nil`.
+(cl-defun loom:promise-error-value (promise)
+  "Returns the rejection error of a `PROMISE`, or `nil` if not rejected.
+
+This function provides non-blocking access to a promise's rejection error.
+It only returns a meaningful result for promises that have been rejected.
+For pending or resolved promises, it returns `nil`.
+
+The returned error is always a `loom-error` struct, as any original
+rejection value is automatically wrapped in one by `loom:promise-reject`.
 
 Arguments:
-- `PROMISE` (loom-promise): The promise to inspect.
+- `PROMISE` (loom-promise): The promise object to inspect.
 
-Returns: The `loom-error` struct, or `nil`."
-  (when (loom:rejected-p promise)
+Returns:
+- (loom-error): The `loom-error` struct if the promise is in the `:rejected`
+  state.
+- `nil` if the promise is pending or resolved.
+
+Signals:
+- `loom-type-error`: If `PROMISE` is not a valid `loom-promise` object
+  (propagated from `loom:promise-rejected-p`)."
+  (when (loom:promise-rejected-p promise)
     (loom-promise-error promise)))
 
-;;;###autoload
-(defun loom:format-promise (promise)
-  "Returns a human-readable string representation of a promise's state.
+(cl-defun loom:promise-settled-p (promise)
+  "Tests whether a `PROMISE` has been settled (resolved or rejected).
+
+A settled promise is one that has completed its asynchronous operation,
+either successfully (resolved) or unsuccessfully (rejected). Settled
+promises will never change state again.
 
 Arguments:
-- `PROMISE` (loom-promise): The promise to format.
+- `PROMISE` (loom-promise): The promise object to test.
 
-Returns: A descriptive string like `#<Promise my-task (promise-123)
-:thread: resolved with ...>`."
+Returns:
+- `t` if the promise has been resolved or rejected.
+- `nil` if the promise is still pending.
+
+Signals:
+- `loom-type-error`: If `PROMISE` is not a valid `loom-promise` object
+  (propagated from `loom:promise-status`)."
+  (not (loom:promise-pending-p promise)))
+
+(cl-defun loom:promise-format (promise)
+  "Returns a human-readable string representation of a `PROMISE` and its state.
+
+This function creates a descriptive string showing the promise's key
+attributes including its name, ID, execution mode, current state, and
+associated value or error. Useful for debugging and logging.
+
+Arguments:
+- `PROMISE` (loom-promise): The promise object to format.
+
+Returns:
+- (string): A formatted string in the form:
+  `#<Promise NAME (ID) MODE: STATE [with VALUE/ERROR]>`
+
+Where:
+- `NAME`: The promise's descriptive name or \"<anonymous>\"
+- `ID`: The unique promise identifier (e.g., `my-task-123`)
+- `MODE`: The execution mode (`:deferred`, `:thread`, or `:process`)
+- `STATE`: Current state (`pending`, `resolved`, or `rejected`)
+- `VALUE/ERROR`: The resolution value or error message (truncated if long)
+
+Signals:
+- `loom-type-error`: If `PROMISE` is not a valid `loom-promise` object.
+
+Side Effects:
+- May query the promise registry for the promise name."
   (unless (loom-promise-p promise)
-    (signal 'loom-type-error (list "Expected a promise" promise)))
-  (let* ((id (loom-promise-id promise))
+    (signal 'loom-type-error
+            (list "Expected a loom-promise object" promise)))
+
+  (let* ((promise-id (loom-promise-id promise))
          (mode (loom-promise-mode promise))
-         (status (loom:status promise))
-         (name (loom-registry-get-promise-name promise)))
+         (status (loom:promise-status promise))
+         (name (or (loom-registry-get-promise-name promise)
+                   "<anonymous>"))
+         ;; Base format string with placeholders for dynamic parts.
+         (base-format "#<Promise %s (%s) %s: %s"))
+
     (pcase status
-      (:pending (format "#<Promise %s (%s) %s: pending>" name id mode))
+      (:pending
+       ;; For pending promises, just format the base string.
+       (format "%s>" (format base-format name promise-id mode "pending")))
+
       (:resolved
-       (format "#<Promise %s (%s) %s: resolved with %s>" name id mode
-               (s-truncate loom-log-value-max-length
-                           (format "%S" (loom:value promise)))))
+       (let* ((value (loom:promise-value promise))
+              (value-str (format "%S" value))
+              ;; Truncate long values for readability in logs.
+              (truncated-value
+               (if (boundp 'loom-log-value-max-length) ; Check if customization is defined
+                   (s-truncate loom-log-value-max-length value-str)
+                 (s-truncate 50 value-str)))) ; Fallback default if not
+         ;; For resolved, append " with VALUE>" to the base format.
+         (format "%s with %s>"
+                 (format base-format name promise-id mode "resolved")
+                 truncated-value)))
+
       (:rejected
-       (format "#<Promise %s (%s) %s: rejected with %s>" name id mode
-               (s-truncate loom-log-value-max-length
-                           (loom:error-message (loom:error-value promise))))))))
+       (let* ((error (loom:promise-error-value promise))
+              (error-msg (if error
+                             (loom-error-message error)
+                           "unknown error"))
+              ;; Truncate long error messages for readability.
+              (truncated-error
+               (if (boundp 'loom-log-value-max-length)
+                   (s-truncate loom-log-value-max-length error-msg)
+                 (s-truncate 50 error-msg))))
+         ;; For rejected, append " with ERROR>" to the base format.
+         (format "%s with %s>"
+                 (format base-format name promise-id mode "rejected")
+                 truncated-error))))))
 
 ;;;###autoload
 (defmacro loom:await (promise-form &optional timeout)
-  "Synchronously and **cooperatively** waits for a promise to settle.
-This macro blocks the current line of execution, but it does **not** freeze
-Emacs. It enters a polling loop that keeps the UI responsive.
+  "Synchronously and cooperatively waits for a promise to settle.
 
-It can wait on a `loom-promise` or any other object that can be converted
-to one via `loom-normalize-awaitable-hook`.
+This macro blocks the current execution context until the promise settles,
+but crucially, it does **NOT** freeze the Emacs UI. It enters a cooperative
+polling loop that repeatedly runs the Loom scheduler (`loom:scheduler-tick`)
+and yields control to Emacs (`sit-for`), keeping the Emacs UI responsive
+during the wait.
+
+The macro can wait on a `loom-promise` or any other object that can be
+converted to a promise via the `loom-normalize-awaitable-hook`.
 
 Arguments:
-- `PROMISE-FORM`: A Lisp form that evaluates to a promise or awaitable object.
-- `TIMEOUT` (number, optional): Max seconds to wait. Defaults to
-  `loom-await-default-timeout`.
+- `PROMISE-FORM` (form): A Lisp form that evaluates to a `loom-promise`
+  instance or an object that `loom-normalize-awaitable-hook` can convert
+  into a `loom-promise`. The form is evaluated once when the macro is executed.
+- `TIMEOUT` (number, optional): The maximum number of seconds to wait before
+  timing out. If not provided, it defaults to `loom-await-default-timeout`.
+  A `nil` timeout means wait indefinitely.
 
-Returns: The resolved value of the promise.
+Returns:
+- (any): The resolved value of the promise if it resolves successfully.
 
 Signals:
-- `loom-await-error`: If the promise is rejected. The original error is the
-  cause.
-- `loom-timeout-error`: If the `TIMEOUT` is exceeded before the promise
-  settles.
+- `loom-await-error`: If the promise is rejected. The original `loom-error`
+  is available as the cause of this error.
+- `loom-timeout-error`: If the specified `timeout` is exceeded before the
+  promise settles. This error contains information about the timeout duration
+  and the promise that was being awaited.
 - `loom-type-error`: If `PROMISE-FORM` does not evaluate to a promise or
-  an object that can be normalized into one."
+  an object that can be normalized into a promise via the awaitable hook.
+- Other errors: Any synchronous errors during form evaluation or unexpected
+  internal issues.
+
+Side Effects:
+- Blocks the current execution context until promise settles or times out.
+- Continues processing Emacs events and scheduler tasks during the wait
+  (cooperative behavior).
+- Updates the asynchronous stack context (`loom-current-async-stack`)
+  for debugging purposes."
   (declare (indent 1) (debug t))
-  `(let* ((p-val ,promise-form)
-          ;; Normalize the awaitable into a standard promise, if needed.
-          (promise (if (loom-promise-p p-val) p-val
-                     (run-hook-with-args-until-success
-                      'loom-normalize-awaitable-hook p-val))))
-     (unless (loom-promise-p promise)
+  `(let* ((promise-form-result ,promise-form)
+          ;; Attempt to normalize the result into a standard `loom-promise`.
+          (normalized-promise
+           (cond
+             ;; If `promise-form-result` is already a `loom-promise`, use it.
+             ((loom-promise-p promise-form-result)
+              promise-form-result)
+             ;; Otherwise, try to normalize it using the `loom-normalize-awaitable-hook`.
+             (t (run-hook-with-args-until-success
+                 'loom-normalize-awaitable-hook promise-form-result)))))
+
+     ;; Validate that we have a valid promise object to await.
+     (unless (loom-promise-p normalized-promise)
        (signal 'loom-type-error
-               (list "await expected a promise or awaitable object" p-val)))
-     (let ((await-label (format "awaiting %S" (loom-promise-id promise))))
-       ;; Add context to the async stack for debugging.
+               (list "loom:await expected a promise or awaitable object, got"
+                     (type-of promise-form-result) promise-form-result)))
+
+     ;; Set up context for debugging and logging the await operation.
+     (let* ((promise-id (loom-promise-id normalized-promise))
+            (await-timeout (or ,timeout loom-await-default-timeout))
+            (await-context (format "awaiting %S (timeout: %s)"
+                                   promise-id await-timeout)))
+
+       ;; Add this `await` operation to the async stack for debugging.
        (cl-letf (((symbol-value 'loom-current-async-stack)
-                  (cons await-label loom-current-async-stack)))
-         (loom--await-cooperative-blocking
-          promise (or ,timeout loom-await-default-timeout))))))
+                  (cons await-context loom-current-async-stack)))
+
+         ;; Log the initiation of the await operation.
+         (loom:log! :debug promise-id "Starting cooperative await (timeout: %s)"
+                   await-timeout)
+
+         ;; Perform the cooperative blocking wait.
+         (condition-case await-error
+             (let ((result (loom--promise-await-cooperative-blocking
+                            normalized-promise await-timeout)))
+               (loom:log! :debug promise-id "Await completed successfully")
+               result)
+
+           ;; Handle specific errors during the await operation
+           (loom-timeout-error
+            (loom:log! :warn promise-id "Await timed out after %s"
+                      await-timeout)
+            (signal (car await-error) (cdr await-error)))
+
+           (loom-await-error
+            (loom:log! :debug promise-id "Await failed with error: %S"
+                      (cdr await-error))
+            (signal (car await-error) (cdr await-error)))
+
+           ;; Catch any other unexpected errors during the await loop.
+           (error
+            (loom:log! :error promise-id "Unexpected error during await: %S"
+                      await-error)
+            (signal (car await-error) (cdr await-error)))))))))
 
 (provide 'loom-promise)
 ;;; loom-promise.el ends here

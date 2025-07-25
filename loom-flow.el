@@ -21,7 +21,7 @@
 
 (require 'cl-lib)
 
-(require 'loom-errors)
+(require 'loom-error)
 (require 'loom-promise)
 (require 'loom-primitives)
 (require 'loom-combinators)
@@ -341,7 +341,7 @@ Arguments:
 
 Returns:
 A `loom-promise` that rejects with a special `loom-flow-break-error`."
-  `(loom:rejected! (loom:make-error :type 'loom-flow-break-error
+  `(loom:rejected! (loom:error! :type 'loom-flow-break-error
                                     :data ,value)))
 
 ;;;###autoload
@@ -352,7 +352,7 @@ error type that is caught by `loom:loop!`.
 
 Returns:
 A `loom-promise` that rejects with a special `loom-flow-continue-error`."
-  `(loom:rejected! (loom:make-error :type 'loom-flow-continue-error)))
+  `(loom:rejected! (loom:error! :type 'loom-flow-continue-error)))
 
 ;;;###autoload
 (defmacro loom:with-timeout! (timeout-ms body-form &key cancel-token)
@@ -374,10 +374,10 @@ rejects with a `loom-flow-timeout-error`."
   `(let ((timeout-secs (/ (float ,timeout-ms) 1000.0)))
      (loom:race
       ,body-form
-      (loom:then (loom:delay timeout-secs :cancel-token ,cancel-token)
+      (loom:then (loom:delay! timeout-secs :cancel-token ,cancel-token)
                  (lambda (_)
                    (loom:rejected!
-                    (loom:make-error
+                    (loom:error
                      :type 'loom-flow-timeout-error
                      :message (format "Operation timed out after %dms"
                                       ,timeout-ms))))))))

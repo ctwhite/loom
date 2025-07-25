@@ -51,8 +51,11 @@ Fields:
 ;;; Public API: Callback Creation
 
 ;;;###autoload
-(cl-defun loom:callback (handler-fn &rest extra-data
-                         &key type (priority 50) data
+(cl-defun loom:callback (handler-fn 
+                         &rest extra-data
+                         &key type 
+                              (priority 50) 
+                              data
                          &allow-other-keys)
   "Create a new `loom-callback` struct.
 
@@ -108,7 +111,9 @@ Examples:
      :priority priority
      :data final-data)))
 
-(cl-defun loom:ensure-callback (task &key (type :deferred) (priority 50) data)
+(cl-defun loom:ensure-callback (task &key (type :deferred) 
+                                          (priority 50) 
+                                          data)
   "Ensures `TASK` is a `loom-callback` struct, creating one if not.
 This utility function normalizes tasks submitted to schedulers, allowing
 users to submit raw functions while the schedulers work with a consistent

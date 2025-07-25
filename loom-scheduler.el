@@ -182,7 +182,7 @@ Side Effects: May start or re-schedule the scheduler's internal timer."
       (setf (loom-scheduler-timer scheduler)
             (run-with-idle-timer delay nil #'loom--scheduler-timer-callback
                                  scheduler))
-      (loom-log :debug (loom-scheduler-id scheduler)
+      (loom:log! :debug (loom-scheduler-id scheduler)
                 "Scheduler timer started with delay %.3fs." delay))))
 
 (defun loom--scheduler-timer-callback (scheduler)
@@ -208,7 +208,7 @@ Arguments:
     ;; Step 2: Process the batch *outside* the lock to avoid blocking other
     ;; operations and to allow the `process-fn` to perform complex work.
     (when batch-to-process
-      (loom-log :debug (loom-scheduler-id scheduler)
+      (loom:log! :debug (loom-scheduler-id scheduler)
                 "Processing a batch of %d tasks." (length batch-to-process))
       (funcall (loom-scheduler-process-fn scheduler) batch-to-process))
 
@@ -220,7 +220,7 @@ Arguments:
       (if (loom:priority-queue-empty-p (loom-scheduler-queue scheduler))
           (progn
             ;; If the queue is empty, we are done. The timer remains nil.
-            (loom-log :debug (loom-scheduler-id scheduler)
+            (loom:log! :debug (loom-scheduler-id scheduler)
                       "Scheduler work complete (queue empty)."))
         ;; If work remains, start a new timer for the next batch.
         (loom--scheduler-start-timer-if-needed scheduler)))))
@@ -283,7 +283,7 @@ Returns: A newly created `loom-scheduler` instance."
            :comparator (or comparator
                            (lambda (a b) (< (funcall priority-fn a)
                                            (funcall priority-fn b))))))
-    (loom-log :info (loom-scheduler-id scheduler)
+    (loom:log! :info (loom-scheduler-id scheduler)
               "Scheduler created (name: %s)." (or name "unnamed"))
     scheduler))
 
@@ -300,7 +300,7 @@ Returns: `nil`.
 Signals: `loom-invalid-scheduler-error` if `SCHEDULER` is invalid.
 Side Effects: Modifies the scheduler's queue and may start its idle timer."
   (loom--validate-scheduler scheduler 'loom:scheduler-enqueue)
-  (loom-log :debug (loom-scheduler-id scheduler) "Enqueuing task.")
+  (loom:log! :debug (loom-scheduler-id scheduler) "Enqueuing task.")
   (loom:with-mutex! (loom-scheduler-lock scheduler)
     ;; Add the task to the priority queue.
     (loom:priority-queue-insert (loom-scheduler-queue scheduler) task)
@@ -323,7 +323,7 @@ Side Effects: Cancels the scheduler's internal idle timer."
     (when-let ((timer (loom-scheduler-timer scheduler)))
       (cancel-timer timer)
       (setf (loom-scheduler-timer scheduler) nil)
-      (loom-log :info (loom-scheduler-id scheduler)
+      (loom:log! :info (loom-scheduler-id scheduler)
                 "Scheduler timer explicitly stopped."))))
 
 ;;;###autoload
@@ -349,7 +349,7 @@ Returns: `t` if a batch was processed, `nil` otherwise (e.g., if the
                (loom-scheduler-batch-size scheduler)))))
     ;; Step 2: Process the batch outside the lock.
     (when batch-to-process
-      (loom-log :debug (loom-scheduler-id scheduler)
+      (loom:log! :debug (loom-scheduler-id scheduler)
                 "Explicit drain processing batch of %d tasks."
                 (length batch-to-process))
       (funcall (loom-scheduler-process-fn scheduler) batch-to-process)

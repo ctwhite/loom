@@ -17,8 +17,7 @@
 
 (require 'cl-lib)
 
-(require 'loom-log)
-(require 'loom-errors)
+(require 'loom-error)
 (require 'loom-lock)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -130,7 +129,7 @@ Returns: The highest-priority item, or signals an error if empty."
 ;;; Public API
 
 ;;;###autoload
-(cl-defun loom:priority-queue
+(cl-defun loom:pqueue
     (&key (comparator #'<) (initial-capacity 32))
   "Create and return a new empty, thread-safe `loom-priority-queue`.
 
@@ -154,7 +153,7 @@ Returns:
     queue))
 
 ;;;###autoload
-(defun loom:priority-queue-length (queue)
+(defun loom:pqueue-length (queue)
   "Return the number of items in the priority `QUEUE`.
 Time complexity: O(1). This operation is thread-safe.
 
@@ -163,11 +162,11 @@ Arguments:
 
 Returns:
 - (integer): The number of items in the queue."
-  (loom--validate-priority-queue queue 'loom:priority-queue-length)
+  (loom--validate-priority-queue queue 'loom:pqueue-length)
   (loom-priority-queue-len queue))
 
 ;;;###autoload
-(defun loom:priority-queue-empty-p (queue)
+(defun loom:pqueue-empty-p (queue)
   "Return non-nil if the priority `QUEUE` is empty.
 Time complexity: O(1). This operation is thread-safe.
 
@@ -176,11 +175,11 @@ Arguments:
 
 Returns:
 - (boolean): `t` if the queue is empty, `nil` otherwise."
-  (loom--validate-priority-queue queue 'loom:priority-queue-empty-p)
+  (loom--validate-priority-queue queue 'loom:pqueue-empty-p)
   (zerop (loom-priority-queue-len queue)))
 
 ;;;###autoload
-(defun loom:priority-queue-insert (queue item)
+(defun loom:pqueue-insert (queue item)
   "Insert `ITEM` into the priority `QUEUE`.
 Time complexity: O(log n). This operation is thread-safe. The internal
 heap array will automatically resize if capacity is exceeded.
@@ -191,7 +190,7 @@ Arguments:
 
 Returns:
 - The `ITEM` that was inserted."
-  (loom--validate-priority-queue queue 'loom:priority-queue-insert)
+  (loom--validate-priority-queue queue 'loom:pqueue-insert)
   (loom:with-mutex! (loom-priority-queue-lock queue)
     (let* ((len (loom-priority-queue-len queue))
            (capacity (length (loom-priority-queue-heap queue)))
@@ -210,7 +209,7 @@ Returns:
   item)
 
 ;;;###autoload
-(defun loom:priority-queue-peek (queue)
+(defun loom:pqueue-peek (queue)
   "Return the highest-priority item from `QUEUE` without removing it.
 Time complexity: O(1). This operation is thread-safe.
 
@@ -219,13 +218,13 @@ Arguments:
 
 Returns:
 - (any or nil): The highest-priority item, or `nil` if the queue is empty."
-  (loom--validate-priority-queue queue 'loom:priority-queue-peek)
+  (loom--validate-priority-queue queue 'loom:pqueue-peek)
   (loom:with-mutex! (loom-priority-queue-lock queue)
-    (unless (loom:priority-queue-empty-p queue)
+    (unless (loom:pqueue-empty-p queue)
       (aref (loom-priority-queue-heap queue) 0))))
 
 ;;;###autoload
-(defun loom:priority-queue-pop (queue)
+(defun loom:pqueue-pop (queue)
   "Pop (remove and return) the highest-priority item from `QUEUE`.
 Time complexity: O(log n). This operation is thread-safe.
 
@@ -237,12 +236,12 @@ Returns:
 
 Signals:
 - `error` if the queue is empty."
-  (loom--validate-priority-queue queue 'loom:priority-queue-pop)
+  (loom--validate-priority-queue queue 'loom:pqueue-pop)
   (loom:with-mutex! (loom-priority-queue-lock queue)
     (loom--priority-queue-pop-internal queue)))
 
 ;;;###autoload
-(defun loom:priority-queue-pop-n (queue n)
+(defun loom:pqueue-pop-n (queue n)
   "Remove and return the `N` highest-priority items from `QUEUE`.
 Items are returned in priority order.
 
@@ -255,17 +254,17 @@ Returns:
 
 Signals:
 - `error` if `N` is not a non-negative integer."
-  (loom--validate-priority-queue queue 'loom:priority-queue-pop-n)
+  (loom--validate-priority-queue queue 'loom:pqueue-pop-n)
   (unless (and (integerp n) (>= n 0))
     (error "N must be a non-negative integer"))
   (loom:with-mutex! (loom-priority-queue-lock queue)
-    (let ((count (min n (loom:priority-queue-length queue))))
+    (let ((count (min n (loom:pqueue-length queue))))
       (when (> count 0)
         (cl-loop repeat count
                  collect (loom--priority-queue-pop-internal queue))))))
 
 ;;;###autoload
-(cl-defun loom:priority-queue-remove (queue item &key (test #'eql))
+(cl-defun loom:pqueue-remove (queue item &key (test #'eql))
   "Remove `ITEM` from the priority `QUEUE`.
 Time complexity: O(n) due to the linear search for the item, plus
 O(log n) for removal. This operation is thread-safe.
@@ -278,7 +277,7 @@ Arguments:
 
 Returns:
 - (boolean): `t` if the item was found and removed, `nil` otherwise."
-  (loom--validate-priority-queue queue 'loom:priority-queue-remove)
+  (loom--validate-priority-queue queue 'loom:pqueue-remove)
   (loom:with-mutex! (loom-priority-queue-lock queue)
     (let* ((heap (loom-priority-queue-heap queue))
            (len (loom-priority-queue-len queue))
@@ -305,7 +304,7 @@ Returns:
         t)))))
 
 ;;;###autoload
-(defun loom:priority-queue-clear (queue)
+(defun loom:pqueue-clear (queue)
   "Remove all items from the priority `QUEUE`.
 Time complexity: O(1). This operation is thread-safe.
 
@@ -314,7 +313,7 @@ Arguments:
 
 Returns:
 - `nil`."
-  (loom--validate-priority-queue queue 'loom:priority-queue-clear)
+  (loom--validate-priority-queue queue 'loom:pqueue-clear)
   (loom:with-mutex! (loom-priority-queue-lock queue)
     (setf (loom-priority-queue-len queue) 0)
     (setf (loom-priority-queue-heap queue)
@@ -322,7 +321,7 @@ Returns:
   nil)
 
 ;;;###autoload
-(defun loom:priority-queue-status (queue)
+(defun loom:pqueue-status (queue)
   "Return a snapshot of the `QUEUE`'s current status.
 This function is `interactive` for easy inspection during development.
 
@@ -333,11 +332,11 @@ Returns:
 - (plist): A property list containing `:length`, `:capacity`, and
   `:is-empty`."
   (interactive)
-  (loom--validate-priority-queue queue 'loom:priority-queue-status)
+  (loom--validate-priority-queue queue 'loom:pqueue-status)
   (loom:with-mutex! (loom-priority-queue-lock queue)
     `(:length ,(loom-priority-queue-len queue)
       :capacity ,(length (loom-priority-queue-heap queue))
-      :is-empty ,(loom:priority-queue-empty-p queue))))
+      :is-empty ,(loom:pqueue-empty-p queue))))
 
 (provide 'loom-priority-queue)
 ;;; loom-priority-queue.el ends here

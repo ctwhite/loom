@@ -19,7 +19,7 @@
 ;; specific aspect of loomrency:
 ;;
 ;; - Foundational Data Structures:
-;;   - `loom-log`: Centralized logging.
+;;   - `loom:log!`: Centralized logging.
 ;;   - `loom-errors`: Standardized error objects and handling.
 ;;   - `loom-lock`: Thread-safe mutexes.
 ;;   - `loom-queue`, `loom-priority-queue`: Core queue implementations.
@@ -55,12 +55,11 @@
 
 ;; Foundational Data Structures
 (require 'loom-log)
-(require 'loom-errors)
+(require 'loom-error)
 (require 'loom-callback)
 (require 'loom-lock)
 (require 'loom-queue)
 (require 'loom-priority-queue)
-(require 'loom-thread-polling)
 
 ;; Schedulers and Core Promise System
 (require 'loom-microtask)

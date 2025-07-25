@@ -34,7 +34,7 @@
 (require 'cl-lib)
 
 (require 'loom-log)
-(require 'loom-errors)
+(require 'loom-error)
 (require 'loom-callback)
 (require 'loom-lock)
 (require 'loom-queue)
@@ -112,7 +112,7 @@ Arguments:
 - `overflowed-callbacks` (list): The list of callbacks that were dropped.
 
 Returns: `nil`."
-  (loom-log :warn (loom-microtask-queue-lock microtask-queue)
+  (loom:log! :warn (loom-microtask-queue-lock microtask-queue)
             "Microtask queue overflow: %d callbacks dropped. (Capacity: %d)"
             (length overflowed-callbacks)
             (loom-microtask-queue-capacity microtask-queue))
@@ -134,7 +134,7 @@ Side Effects:
   (cl-block loom--drain-microtask-queue
     (cl-incf (loom-microtask-queue-drain-tick-counter microtask-queue))
     (let ((tick (loom-microtask-queue-drain-tick-counter microtask-queue)))
-      (loom-log :debug (loom-microtask-queue-lock microtask-queue)
+      (loom:log! :debug (loom-microtask-queue-lock microtask-queue)
                 "Microtask drain tick %d starting." tick)
 
       ;; Loop until the queue is completely empty. Microtasks can enqueue
@@ -157,11 +157,11 @@ Side Effects:
           (unless batch
             (loom:with-mutex! (loom-microtask-queue-lock microtask-queue)
               (setf (loom-microtask-queue-drain-scheduled-p microtask-queue) nil))
-            (loom-log :debug (loom-microtask-queue-lock microtask-queue)
+            (loom:log! :debug (loom-microtask-queue-lock microtask-queue)
                       "Microtask drain tick %d finished, queue is empty." tick)
             (cl-return-from loom--drain-microtask-queue nil))
 
-          (loom-log :debug (loom-microtask-queue-lock microtask-queue)
+          (loom:log! :debug (loom-microtask-queue-lock microtask-queue)
                     "Processing a batch of %d microtasks in tick %d."
                     (length batch) tick)
           ;; Step 3: Execute the batch of tasks *outside* the lock. This is
@@ -170,7 +170,7 @@ Side Effects:
             ;; A failing microtask should not stop others in the batch from running.
             (condition-case err
                 (funcall executor cb)
-              (error (loom-log :error
+              (error (loom:log! :error
                                (loom-microtask-queue-lock microtask-queue)
                                "Unhandled error in microtask executor: %S" err)))))))))
 
@@ -255,14 +255,14 @@ Signals: `error` if `CALLBACK` is not a `loom-callback`."
         (condition-case err
             (funcall handler microtask-queue overflowed)
           (error
-           (loom-log :error nil
-                     "Error occurred within custom microtask overflow handler: %S"
-                     err)))))
+           (loom:log! :trace nil
+                      "Error occurred within custom microtask overflow handler: %S"
+                      err)))))
 
     ;; Step 4: Run the drain if we are responsible for starting it.
     ;; This is done *outside* the lock to prevent deadlocks.
     (when needs-drain
-      (loom-log :debug (loom-microtask-queue-lock microtask-queue)
+      (loom:log! :debug (loom-microtask-queue-lock microtask-queue)
                 "Enqueue triggered an immediate, synchronous microtask drain.")
       (loom--drain-microtask-queue microtask-queue))
     nil))
@@ -294,7 +294,7 @@ Side Effects: Executes all pending microtasks in the queue."
 
     ;; If we were the ones to start the drain, run the drain loop.
     (when initiated-drain-p
-      (loom-log :debug (loom-microtask-queue-lock microtask-queue)
+      (loom:log! :debug (loom-microtask-queue-lock microtask-queue)
                 "Explicit call to `loom:microtask-drain` initiated a drain.")
       (loom--drain-microtask-queue microtask-queue))
     initiated-drain-p))

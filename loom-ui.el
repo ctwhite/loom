@@ -107,7 +107,7 @@ Returns `nil` if no promise is found or the ID is invalid."
 
 Returns a vector suitable for `tabulated-list-entries`."
   (when-let ((meta (loom-registry-get-promise-meta promise)))
-    (let* ((status (loom:status promise))
+    (let* ((status (loom:promise-status promise))
            (age (format "%.2f" (- (float-time)
                                   (loom-promise-meta-creation-time meta))))
            (parent-id (when-let ((p (loom-promise-meta-parent-promise meta)))
@@ -175,16 +175,16 @@ This command is bound to `i` and `<RET>` in `loom-ui-mode`."
         (insert (format "--- Details for Promise: %S ---\n\n"
                         (loom-promise-id promise)))
         (insert "** Name:**\t" (or (loom-promise-meta-name meta) "N/A") "\n")
-        (insert "** Status:**\t" (format "%S" (loom:status promise)) "\n")
+        (insert "** Status:**\t" (format "%S" (loom:promise-status promise)) "\n")
         (insert "** Mode:**\t" (format "%S" (loom-promise-mode promise)) "\n")
         ;; Use pp for values and errors for better readability of complex objects
-        (when-let ((val (loom:value promise)))
+        (when-let ((val (loom:promise-value promise)))
           (insert "** Value:**\n")
           (with-temp-buffer
             (pp val (current-buffer))
             (insert-buffer-substring (current-buffer)))
           (insert "\n"))
-        (when-let ((err (loom:error-value promise)))
+        (when-let ((err (loom:promise-error-value promise)))
           (insert "** Error:**\n")
           (with-temp-buffer
             (pp err (current-buffer))
@@ -210,7 +210,7 @@ This command is bound to `i` and `<RET>` in `loom-ui-mode`."
 This command is bound to `c` in `loom-ui-mode`."
   (interactive)
   (if-let ((promise (loom-ui--get-promise-at-point)))
-      (if (loom:pending-p promise)
+      (if (loom:promise-pending-p promise)
           (progn
             (loom:cancel promise "Cancelled via UI")
             (message "Cancelled promise: %s" (loom-promise-id promise))

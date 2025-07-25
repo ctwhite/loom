@@ -1,151 +1,161 @@
 ;;; loom-config.el --- Core functionality for Loom Promises -*- lexical-binding: t; -*-
 
+;; Copyright (C) 2024 Loom Contributors
+;; Author: Loom Contributors
+;; Version: 2.0.0
+;; Package-Requires: ((emacs "28.1") (cl-lib "0.5"))
+;; Keywords: concurrency, promises, async, core
+;; URL: https://github.com/loom/loom
+
 ;;; Commentary:
 ;;
-;; This file defines the global infrastructure for the Loom concurrency library.
-;; It acts as the central orchestrator, responsible for managing the lifecycle
-;; and execution environment in which all asynchronous operations run.
+;; This file defines the core global infrastructure for the Loom
+;; concurrency library. It acts as the central orchestrator, responsible
+;; for managing the lifecycle and execution environment in which all
+;; asynchronous operations based on promises run.
 ;;
 ;; ## Core Responsibilities
 ;;
 ;; 1.  **Lifecycle Management:** Provides a clear public API (`loom:init`,
-;;     `loom:shutdown`) to start up and tear down the library's global
-;;     resources. Initialization is idempotent, and shutdown is automatically
-;;     handled when Emacs exits.
+;;     `loom:shutdown`) to start up and tear down the library's fundamental
+;;     resources. Initialization is idempotent, and shutdown is
+;;     automatically handled when Emacs exits.
 ;;
 ;; 2.  **Task Scheduling:** Implements and manages two distinct schedulers to
 ;;     comply with Promise/A+ specifications for execution order:
-;;     - **Microtask Queue:** A high-priority queue for immediate, internal
-;;       operations like resolving a promise chain. This queue is always drained
-;;       completely before handling I/O or other tasks, ensuring that promise
-;;       state propagates without delay.
-;;     - **Macrotask Scheduler:** A lower-priority queue for user-provided
-;;       callbacks (e.g., from `.then`, `.catch`). These tasks are processed
-;;       in batches during idle time to avoid blocking the user interface.
+;;     -   **Microtask Queue:** A high-priority queue for immediate, internal
+;;         operations like resolving promise chains. These tasks are
+;;         guaranteed to run before any UI updates or macrotasks.
+;;     -   **Macrotask Scheduler:** A lower-priority queue for user-provided
+;;         callbacks (e.g., from `.then`, `.catch`). These tasks run after
+;;         all microtasks are drained in a given event loop tick.
 ;;
-;; 3.  **System Coordination:** It initializes and coordinates with other Loom
-;;     subsystems, particularly the Inter-Process/Thread Communication (IPC)
-;;     module (`loom-ipc.el`), which is essential for settling promises from
-;;     background threads or external processes.
+;; 3.  **Extensible Initialization/Shutdown:** Provides hooks for other
+;;     Loom subsystems (like logging or distributed processing) to
+;;     "plug in" their own initialization and cleanup routines, ensuring
+;;     a coordinated startup and shutdown.
 ;;
-;; 4.  **Health Monitoring:** Optionally provides periodic health checks,
-;;     outputting a consolidated status report of various Loom components
-;;     to the `*Messages*` buffer. This aids in debugging and system oversight.
+;; 4.  **Health Monitoring & Profiling:** Optionally provides periodic
+;;     health checks of its core components and can auto-start the
+;;     performance profiler for instrumenting user code.
 ;;
-;; ## Basic Usage
-;;
-;; Before using any promise features, the library must be initialized once.
-;; This can be a simple call for in-process concurrency, or it can be
-;; configured for communication with other Emacs instances.
-;;
-;; (loom:init) ;; For standard, in-process use.
-;;
-;; (loom:init :my-id "server" :listen-for-incoming-p t) ;; As an IPC server.
-;;
-;; (loom:init :my-id "client" :target-instance-id "server") ;; As an IPC client.
+;; This module focuses purely on the asynchronous execution model and
+;; core resource management, abstracting away concerns like IPC or
+;; distributed logging, which are handled by dedicated extension modules.
 
 ;;; Code:
 
-(require 'cl-lib)
+(require 'cl-lib) ; Common Lisp extensions for enhanced programming
+(require 'seq)    ; Sequence manipulation functions
+(require 's)     ; String manipulation library
 
-(require 'loom-log)
-(require 'loom-errors)
-(require 'loom-registry)
-(require 'loom-callback)
-(require 'loom-promise)
-(require 'loom-scheduler)
-(require 'loom-microtask)
-(require 'loom-ipc)
-(require 'loom-poll)
+(require 'loom-log)       ; For core logging output from loom-config itself
+(require 'loom-error)    ; For `loom:error!` and error reporting
+(require 'loom-registry)  ; For tracking active promises
+(require 'loom-callback)  ; For `loom-callback` struct and `loom:ensure-callback`
+(require 'loom-scheduler) ; For `loom:scheduler` and `loom:scheduler-enqueue`
+(require 'loom-microtask) ; For `loom:microtask-queue` and `loom:microtask-enqueue`
+(require 'loom-profiler)  ; For optional performance profiling
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Forward Declarations
+;;; 1. Forward Declarations
+;; Functions that are defined elsewhere but called in this module.
 
 (declare-function loom-execute-callback "loom-promise")
-(declare-function loom-report-unhandled-rejection "loom-errors")
-(declare-function loom:error-wrap "loom-errors")
+;; loom-promise depends on loom-config for scheduling, and loom-config
+;; depends on loom-promise for its executor. This is a circular dependency
+;; that Emacs Lisp `declare-function` resolves.
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Global State
+;;; 2. Global State
 
 (defvar loom--initialized nil
   "A boolean flag indicating if the Loom library has been initialized.
-This is used to make `loom:init` idempotent and to guard against API usage
-before the system is ready. It is set to `t` at the end of a successful
-`loom:init` call and reset to `nil` during `loom:shutdown`.")
+This flag prevents re-initialization of core components.")
 
 (defvar loom--macrotask-scheduler nil
   "The global scheduler for standard-priority 'macrotasks'.
-This scheduler manages user-provided callbacks from `.then`, `.catch`, and
-`.finally`. It is designed as a lower-priority queue that runs tasks
-cooperatively during idle time, ensuring that long-running callback chains
-do not block the user interface. It processes tasks in batches via
-`loom:scheduler-tick`.")
+These are typically user-defined callbacks from promises or deferred tasks.")
 
 (defvar loom--microtask-scheduler nil
   "The global scheduler for high-priority 'microtasks'.
-This queue handles immediate, critical operations that are fundamental to
-the promise-chaining mechanism, such as propagating a resolution to a
-downstream promise or signaling an `await` latch. According to event loop
-specifications (like those for JavaScript and Promise/A+), the microtask
-queue must be drained completely before processing any other events,
-ensuring the atomicity of promise state transitions.")
+These are primarily internal promise resolution steps, guaranteed to run
+before macrotasks in the same event loop tick.")
 
 (defvar loom--health-check-timer nil
-  "Internal timer for the periodic health check.
-This timer is created by `loom--start-health-check-timer` if health
-checks are enabled, and it is cancelled by `loom--stop-health-check-timer`
-during shutdown.")
+  "Internal Emacs timer for the periodic system health check.
+This timer is managed by `loom-config` itself and logs status reports.")
+
+(defvar loom-config-post-init-hook nil
+  "Normal hook run after Loom's core initialization is complete.
+Functions on this hook should take no arguments. External modules
+(e.g., `warp`) can add their initialization routines here.")
+
+(defvar loom-config-pre-shutdown-hook nil
+  "Normal hook run before Loom's core shutdown begins.
+Functions on this hook should take no arguments. External modules
+(e.g., `warp`) can add their cleanup routines here.")
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Customization
+;;; 3. Customization Variables
 
 (defcustom loom-health-check-enable nil
-  "If non-nil, periodically output Loom's system status. Off by default."
+  "If non-nil, enable periodic logging of Loom's core system status.
+This provides a periodic snapshot of scheduler queues, registry sizes, etc.
+Off by default."
   :type 'boolean
   :group 'loom)
 
 (defcustom loom-health-check-interval 30
-  "Interval in seconds for the periodic health check output."
+  "Interval in seconds for the periodic health check output.
+Only effective if `loom-health-check-enable` is non-nil."
   :type '(integer :min 1)
   :group 'loom)
 
+(defcustom loom-profiler-autostart-features nil
+  "A list of feature symbols to automatically profile when `loom:init` is
+called. If non-nil, `loom-profiler` will be started and these features
+instrumented. Example: `(my-feature-one my-feature-two)`."
+  :type '(repeat symbol)
+  :group 'loom)
+
+(defcustom loom-profiler-autostart-interval 10
+  "The reporting interval in seconds for the auto-started profiler.
+Only effective if `loom-profiler-autostart-features` is non-nil."
+  :type 'integer
+  :group 'loom)
+
+;; Removed loom-log-autostart-server and its related defcustoms.
+;; Log server initialization is now handled externally, e.g., by 'warp-log'.
+
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Internal Helpers: Health Checks
+;;; 4. Internal Helpers: Health Checks (`loom--health-check-*`)
 
-(defun loom--indent-multiline-string (str indent-level)
+(defun loom--health-check-indent-string (str indent-level)
   "Indent every line of a multi-line string by `INDENT-LEVEL` spaces.
-This is a small formatting utility used exclusively by
-`loom--perform-health-check` to make its output readable by ensuring
-all lines in the final report are properly aligned.
-
-Arguments:
-- `STR` (string): The string to indent, which may contain newlines.
-- `INDENT-LEVEL` (integer): The number of spaces to prepend to each line.
-
-Returns:
-A new, indented string, or `nil` if `STR` is `nil`."
+Helper for formatting health check reports."
   (when str
     (let ((indent-prefix (make-string indent-level ?\s)))
       (s-replace-regexp
        "\\`" indent-prefix
        (s-replace-regexp "\n" (concat "\n" indent-prefix) str)))))
 
-(defun loom--perform-health-check ()
-  "Collect and log a comprehensive status report of Loom's components.
+(defun loom--health-check-perform ()
+  "Collect and log a comprehensive status report of Loom's core components.
 This function is the core of the optional health monitoring system. It
-gathers status information from all major subsystems (schedulers,
-registries, thread pools, etc.) and formats it into a single,
-easy-to-read log message. This is invaluable for debugging live
-systems to understand the current state of all concurrent operations.
+gathers status information from schedulers, registries, and logs it.
+
+Arguments: None.
+
+Returns: `nil`.
 
 Side Effects:
-- Outputs a multi-line log message to the `*Messages*` buffer or
-  the buffer configured via `loom-log-buffer`."
+- Outputs a multi-line log message to the default log server (`loom:log!`)."
   (let* ((base-indent 4)
          (line-indent 4)
          (total-indent (+ base-indent line-indent))
-         ;; Collect status reports from all relevant subsystems.
+         ;; Collect status reports from all relevant core subsystems.
+         ;; Removed references to loom-poll and loom-ipc related stats.
          (raw-status-lines
           (list
            (format "Error Stats: %S" (loom:error-statistics))
@@ -154,380 +164,373 @@ Side Effects:
                    (loom:microtask-status loom--microtask-scheduler))
            (format "Macrotask Scheduler Status: %S"
                    (loom:scheduler-status loom--macrotask-scheduler))
-           (format "Thread Polling Scheduler Status: %S"
-                   (loom:poll-scheduler-status))
-           (format "Thread Polling System Health: %S"
-                   (loom:poll-system-health-report))
-           (format "Thread Pool Status: %S"
-                   (loom:thread-pool-status))
            (format "Promise Registry Status: %S" (loom:registry-status))
            (format "Promise Registry Metrics: %S" (loom:registry-metrics)))))
     (let ((indented-report-lines
-           (--map (loom--indent-multiline-string it total-indent)
-                  raw-status-lines)))
-      ;; Combine all generated report lines with a header and footer for clarity.
-      (loom-log :info nil
-                (string-join
-                 (append (list (loom--indent-multiline-string
-                                "--- Loom System Health Check ---" base-indent))
-                         indented-report-lines
-                         (list (loom--indent-multiline-string
-                                "--- End Health Check ---" base-indent)))
-                 "\n")))))
+           (seq-map (lambda (line)
+                      (loom--health-check-indent-string line total-indent))
+                    raw-status-lines)))
+      ;; Combine all generated report lines with a header for clarity.
+      (loom:log! :info 'loom-config
+                 (string-join
+                  (append (list (loom--health-check-indent-string
+                                 "--- Loom Core System Health Check ---" base-indent))
+                          indented-report-lines
+                          (list (loom--health-check-indent-string
+                                 "--- End Health Check ---" base-indent)))
+                  "\n")))))
 
-(defun loom--start-health-check-timer ()
+(defun loom--health-check-start-timer ()
   "Start the periodic health check timer if enabled via custom variables.
-This function checks `loom-health-check-enable` and ensures a timer
-is not already running before creating a new one.
 
-Side Effects:
-- Creates a new timer and stores it in `loom--health-check-timer`.
-- Logs a message indicating the timer has started."
-  (when (and loom-health-check-enable
-             (not (timerp loom--health-check-timer))
-             (> loom-health-check-interval 0))
-    (loom-log :info nil "Starting Loom health check timer (interval: %ds)."
-              loom-health-check-interval)
-    (setq loom--health-check-timer
-          (run-with-timer loom-health-check-interval
-                          loom-health-check-interval
-                          #'loom--perform-health-check))))
-
-(defun loom--stop-health-check-timer ()
-  "Stop the periodic health check timer.
-This function is idempotent; it is safe to call even if no timer
-is currently active.
-
-Side Effects:
-- Cancels the timer stored in `loom--health-check-timer`.
-- Resets `loom--health-check-timer` to `nil`."
-  (when (timerp loom--health-check-timer)
-    (loom-log :info nil "Stopping Loom health check timer.")
-    (cancel-timer loom--health-check-timer)
-    (setq loom--health-check-timer nil)))
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Internal Helpers: Schedulers
-
-(defun loom--callback-fifo-priority (cb-a cb-b)
-  "Comparator for the macrotask scheduler's priority queue.
-This function implements a two-level sort. It first compares callbacks by
-their `:priority` field, where a lower integer signifies a higher
-priority. If two callbacks have the same priority, it uses their
-`:sequence-id` as a tie-breaker. This secondary check is crucial for
-guaranteeing that callbacks of the same priority are executed in the
-First-In, First-Out (FIFO) order in which they were enqueued.
-
-Arguments:
-- `CB-A` (loom-callback): The first callback to compare.
-- `CB-B` (loom-callback): The second callback to compare.
-
-Returns:
-`t` if `CB-A` has a higher priority than `CB-B`, `nil` otherwise."
-  (let ((prio-a (loom-callback-priority cb-a))
-        (prio-b (loom-callback-priority cb-b)))
-    (if (= prio-a prio-b)
-        ;; If priorities are equal, the one created first (lower ID) wins.
-        (< (loom-callback-sequence-id cb-a)
-           (loom-callback-sequence-id cb-b))
-      ;; Otherwise, the one with the lower priority number wins.
-      (< prio-a prio-b))))
-
-(defun loom--promise-microtask-overflow-handler (queue overflowed-cbs)
-  "Robustly reject promises associated with overflowed microtasks.
-This function is a critical safety net. If the microtask queue ever
-fills up (which should be rare), this handler is invoked. Its job is to
-prevent the system from getting into an inconsistent state where promise
-callbacks are silently dropped. It does this by finding the promise
-linked to each dropped callback and explicitly rejecting it with an
-error, ensuring that downstream `.catch` handlers are triggered.
-
-Arguments:
-- `QUEUE` (loom-microtask-queue): The queue instance that overflowed.
-- `OVERFLOWED-CBS` (list): The list of `loom-callback` structs that were dropped.
+Arguments: None.
 
 Returns: `nil`.
 
 Side Effects:
-- Logs an error to the `*Messages*` buffer.
-- Attempts to find and reject the promise associated with each
-  overflowed callback, which will trigger further promise chain execution."
+- Creates a new timer and stores it in `loom--health-check-timer`."
+  (when (and loom-health-check-enable
+             (not (timerp loom--health-check-timer))
+             (> loom-health-check-interval 0))
+    (loom:log! :info 'loom-config
+               "Starting Loom health check timer (interval: %ds)."
+               loom-health-check-interval)
+    (setq loom--health-check-timer
+          (run-with-timer loom-health-check-interval
+                          loom-health-check-interval
+                          #'loom--health-check-perform))))
+
+(defun loom--health-check-stop-timer ()
+  "Stop the periodic health check timer. This function is idempotent.
+
+Arguments: None.
+
+Returns: `nil`.
+
+Side Effects:
+- Cancels the timer stored in `loom--health-check-timer`."
+  (when (timerp loom--health-check-timer)
+    (loom:log! :info 'loom-config "Stopping Loom health check timer.")
+    (cancel-timer loom--health-check-timer)
+    (setq loom--health-check-timer nil)))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; 5. Internal Helpers: Schedulers (`loom--scheduler-*`)
+
+(defun loom--scheduler-callback-fifo-priority (cb-a cb-b)
+  "Comparator for the macrotask scheduler's priority queue.
+This function implements a two-level sort. It first compares callbacks by
+their `:priority` field, where a lower integer signifies a higher
+priority. If two callbacks have the same priority, it uses their
+`:sequence-id` as a tie-breaker to ensure FIFO ordering."
+  (let ((prio-a (loom-callback-priority cb-a))
+        (prio-b (loom-callback-priority cb-b)))
+    (if (= prio-a prio-b)
+        (< (loom-callback-sequence-id cb-a)
+           (loom-callback-sequence-id cb-b))
+      (< prio-a prio-b))))
+
+(defun loom--scheduler-microtask-overflow-handler (queue overflowed-cbs)
+  "Robustly reject promises associated with overflowed microtasks.
+This is a safety net. If the microtask queue fills up, this handler
+finds the promise linked to each dropped callback and explicitly rejects
+it with an error, ensuring that downstream `.catch` handlers are triggered."
   (let ((msg (format "Microtask queue overflow (capacity: %d, dropped: %d)"
                      (loom-microtask-queue-capacity queue)
                      (length overflowed-cbs))))
-    (loom-log :error nil "%s" msg)
+    (loom:log! :error 'loom-config "%s" msg)
     (dolist (cb overflowed-cbs)
       (condition-case err
-          (when-let* ((data (loom-callback-data cb))
-                      (promise-id (plist-get data :promise-id))
-                      (promise (loom-registry-get-promise-by-id promise-id)))
+          (when-let* ((data (plist-get (loom-callback-data cb) :promise-id))
+                      (promise (loom-registry-get-promise-by-id data)))
             (if promise
-                (loom:reject promise (loom:make-error
-                                      :type 'loom-microtask-queue-overflow
-                                      :message msg))
-              (loom-log :warn (or promise-id 'unknown)
-                        "Could not find promise for overflowed callback.")))
-        (error (loom-log :error nil "Error in overflow handler for %S: %S"
-                         cb err))))))
+                ;; Rejects the promise with a specific overflow error.
+                (loom:promise-reject promise (loom:error!
+                                    :type 'loom-microtask-queue-overflow
+                                    :message msg))
+              (loom:log! :warn (or data 'unknown)
+                         "Could not find promise for overflowed callback.")))
+        (error (loom:log! :error 'loom-config
+                          "Error in overflow handler for %S: %S"
+                          cb err))))))
 
-(defun loom--init-schedulers ()
+(defun loom--scheduler-init-core-schedulers ()
   "Initialize the global microtask and macrotask schedulers.
-This function creates the two core schedulers required by the Loom
-event loop. The microtask scheduler handles high-priority internal
-operations essential for promise mechanics, while the macrotask
-scheduler handles lower-priority user-provided callbacks. This
-separation is fundamental to the library's design and compliance
-with Promise/A+ standards. This function is idempotent.
+This function is idempotent and sets up the fundamental asynchronous
+execution queues for Loom.
+
+Arguments: None.
 
 Returns: `nil`.
 
 Side Effects:
 - Modifies the global `loom--microtask-scheduler` and
-  `loom--macrotask-scheduler` variables, assigning them new
-  scheduler instances.
+  `loom--macrotask-scheduler` variables.
 
 Signals:
 - `loom-initialization-error`: On failure to create either scheduler."
   ;; Initialize the high-priority microtask queue for internal operations.
   (unless loom--microtask-scheduler
-    (loom-log :info nil "Initializing microtask scheduler.")
+    (loom:log! :info 'loom-config "Initializing microtask scheduler.")
     (condition-case err
         (setq loom--microtask-scheduler
               (loom:microtask-queue
                :executor #'loom-execute-callback
-               :overflow-handler #'loom--promise-microtask-overflow-handler))
+               :overflow-handler #'loom--scheduler-microtask-overflow-handler))
       (error (signal 'loom-initialization-error
                      `("Microtask scheduler init failed" ,err)))))
 
   ;; Initialize the standard-priority macrotask scheduler for user callbacks.
   (unless loom--macrotask-scheduler
-    (loom-log :info nil "Initializing macrotask scheduler.")
+    (loom:log! :info 'loom-config "Initializing macrotask scheduler.")
     (condition-case err
         (setq loom--macrotask-scheduler
               (loom:scheduler
                :name "loom-macrotask-scheduler"
-               :comparator #'loom--callback-fifo-priority
+               :comparator #'loom--scheduler-callback-fifo-priority
                :process-fn
                (lambda (batch)
+                 ;; Each item in the batch is a loom-callback.
                  (dolist (item batch)
                    (condition-case e (loom-execute-callback item)
-                     ;; If a callback execution fails, it constitutes an
-                     ;; unhandled rejection. We wrap the error and report it
-                     ;; to the centralized handler in `loom-errors.el`.
                      (error
+                      ;; Report unhandled rejections if the callback itself fails.
                       (let ((error-obj (loom:error-wrap
-                                         :data `(:callback ,item))))
+                                        :message "Macrotask callback failed."
+                                        :data `(:callback ,item))))
                         (loom-report-unhandled-rejection error-obj))))))))
       (error (signal 'loom-initialization-error
                      `("Macrotask scheduler init failed" ,err))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Public API: Scheduling
+;;; 6. Public API: Scheduling
 
 ;;;###autoload
 (defun loom:scheduler-tick ()
-  "Perform one cooperative 'tick' of the global schedulers.
-This function is the heartbeat of the Loom concurrency system. It is
-called cooperatively by the promise machinery when asynchronous
-work completes.
+  "Performs one cooperative 'tick' of the global schedulers.
+This function is the heartbeat of the Loom concurrency system, enabling
+asynchronous operations to progress. It processes tasks in a specific,
+priority-driven order to ensure correctness and responsiveness:
 
-The execution order is:
-1.  **I/O and Timers:** Yield to process pending I/O and timers.
-2.  **IPC Queue:** Drain messages from background threads.
-3.  **Microtask Queue:** Drain *all* pending microtasks.
-4.  **Macrotask Queue:** Process *one batch* of macrotasks.
+1.  **I/O and Timers:** Yields briefly to allow Emacs to process any
+    pending I/O events or scheduled timers. This keeps the UI responsive.
+2.  **Microtask Queue:** Drains *all* pending microtasks to completion.
+    Microtasks have the highest priority and must finish before any
+    macrotasks or further I/O in the current tick.
+3.  **Macrotask Queue:** Processes *one batch* of macrotasks. Macrotasks
+    are lower priority and allow for fair scheduling of user-defined work.
+
+Arguments: None.
 
 Returns: `nil`.
 
 Side Effects:
-- Calls `accept-process-output` to handle I/O from subprocesses.
 - Drains and executes tasks from both schedulers, which involves
   invoking user-provided callback functions with their own side effects.
+- Can trigger additional `loom:log!` calls for errors or status.
 
 Signals:
-- `loom-initialization-error`: If called before `loom:init`."
+- `loom-initialization-error`: If called before `loom:init` has been
+  successfully completed."
   (unless loom--initialized
     (signal 'loom-initialization-error
             '("Loom library not initialized. Call `loom:init` first.")))
   (condition-case err
       (progn
-        ;; Yield to other Emacs processes first to keep the UI responsive.
+        ;; Yield to Emacs's event loop for I/O and timers.
         (accept-process-output nil 0 1)
-        ;; Drain messages from background threads to the main thread.
-        (loom:ipc-drain-queue)
-        ;; Drain high-priority tasks immediately and completely, as per spec.
+        ;; No IPC drain here; that's external.
         (when loom--microtask-scheduler
           (loom:microtask-drain loom--microtask-scheduler))
-        ;; Cooperatively process one batch of standard tasks to avoid starving the UI.
         (when loom--macrotask-scheduler
           (loom:scheduler-drain loom--macrotask-scheduler)))
-    (error (loom-log :error nil "Error during scheduler tick: %S" err)))
+    (error (loom:log! :error 'loom-config "Error during scheduler tick: %S"
+                      err)))
   nil)
 
 ;;;###autoload
 (cl-defun loom:deferred (task &key (priority 50))
-  "Schedule a `TASK` for deferred execution on the macrotask scheduler.
+  "Schedules a `TASK` for deferred execution on the macrotask scheduler.
 This is the standard way to schedule work that should run on the main
-thread without blocking, after the current chain of operations has
-completed. It ensures that the task executes on a clean stack.
+thread without blocking the current flow of execution. It ensures that
+the task executes on a clean stack in a future event loop tick.
 
 Arguments:
-- `TASK` (function or loom-callback): The task to execute. If a raw
-  function is provided, it will be wrapped in a `loom-callback` struct.
-- `:PRIORITY` (integer): An optional priority for the task, where a
-  lower number signifies higher priority. Defaults to 50.
+- `TASK` (function or loom-callback): The task (a function with no
+  arguments) to execute. If it's a `loom-callback`, it's used directly.
+- `:PRIORITY` (integer, optional): An integer priority for the task,
+  where a lower number (e.g., 0) indicates a higher priority. Default is 50.
 
 Returns: `nil`.
 
 Side Effects:
-- Enqueues a callback onto the `loom--macrotask-scheduler`.
+- Enqueues a `loom-callback` onto the `loom--macrotask-scheduler`.
 
 Signals:
-- `loom-scheduler-error`: If the scheduler is not initialized or if
-  enqueuing fails."
+- `loom-scheduler-error`: If the macrotask scheduler is not initialized
+  or if enqueuing the task fails."
   (unless loom--macrotask-scheduler
     (signal 'loom-scheduler-error '("Macrotask scheduler not initialized.")))
-  (let ((callback (loom:ensure-callback task :type :deferred :priority priority)))
-    (condition-case err (loom:scheduler-enqueue loom--macrotask-scheduler callback)
+  (let ((callback (loom:ensure-callback task :type :deferred
+                                        :priority priority)))
+    (condition-case err
+        (loom:scheduler-enqueue loom--macrotask-scheduler callback)
       (error (signal 'loom-scheduler-error
                      `("Failed to enqueue deferred task" ,err))))))
 
 ;;;###autoload
 (cl-defun loom:microtask (task &key (priority 0))
-  "Schedule a `TASK` for immediate execution on the microtask queue.
+  "Schedules a `TASK` for immediate execution on the microtask queue.
 Microtasks are for high-priority, short-lived operations, primarily used
-internally by the promise implementation itself. They are guaranteed to
-run to completion before any other event handling (like I/O or macrotasks)
-occurs in the current tick of the event loop.
+internally by the promise implementation itself to process promise
+resolutions or rejections. They are guaranteed to run to completion
+before any other event handling (like I/O or macrotasks) occurs within
+the current tick of the Emacs event loop.
 
 Arguments:
-- `TASK` (function or loom-callback): The task to execute. If a raw
-  function is provided, it will be wrapped in a `loom-callback` struct.
-- `:PRIORITY` (integer): An optional priority for the task. Defaults to 0.
+- `TASK` (function or loom-callback): The task (a function with no
+  arguments) to execute. If it's a `loom-callback`, it's used directly.
+- `:PRIORITY` (integer, optional): An integer priority for the task.
+  Microtasks are typically processed in FIFO order within their priority.
+  Default is 0 (highest priority for microtasks).
 
 Returns: `nil`.
 
 Side Effects:
-- Enqueues a callback onto the `loom--microtask-scheduler`.
+- Enqueues a `loom-callback` onto the `loom--microtask-scheduler`.
 
 Signals:
-- `loom-scheduler-error`: If the scheduler is not initialized or if
-  enqueuing fails."
+- `loom-scheduler-error`: If the microtask scheduler is not initialized
+  or if enqueuing the task fails."
   (unless loom--microtask-scheduler
     (signal 'loom-scheduler-error '("Microtask scheduler not initialized.")))
   (let ((callback (loom:ensure-callback task :priority priority)))
-    (condition-case err (loom:microtask-enqueue loom--microtask-scheduler callback)
+    (condition-case err
+        (loom:microtask-enqueue loom--microtask-scheduler callback)
       (error (signal 'loom-scheduler-error
                      `("Failed to enqueue microtask" ,err))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Public API: Initialization/Shutdown
+;;; 7. Public API: Initialization/Shutdown (`loom:init`, `loom:shutdown`)
 
 ;;;###autoload
-(cl-defun loom:init (&key my-id target-instance-id (listen-for-incoming-p t))
-  "Initialize the entire Loom concurrency library.
-This function sets up the global schedulers, IPC mechanisms, and other
-core resources required for asynchronous operations. It is idempotent,
-meaning it is safe to call multiple times; it will only perform the
-initialization once. This function must be called before any other
-Loom API function is used.
+(cl-defun loom:init ()
+  "Initializes the core Loom concurrency library.
 
-Arguments:
-- `:MY-ID` (string, optional): A unique string identifier for this
-  Emacs instance, used for naming its input FIFO. Defaults to the
-  current process ID.
-- `:TARGET-INSTANCE-ID` (string, optional): The ID of the target Emacs
-  instance for sending messages. If non-nil, an output pipe is created.
-- `:LISTEN-FOR-INCOMING-P` (boolean, optional): If t (the default),
-  create an input pipe to receive messages from other processes.
+This function sets up the global microtask and macrotask schedulers,
+and other fundamental core resources required for asynchronous
+operations. It is idempotent; calling it multiple times will only
+perform initialization once.
 
-Returns:
-- `nil`.
+This function *must* be called before any other Loom API function is
+used (e.g., creating promises, scheduling tasks).
 
-Side Effects:
-- Modifies global state variables (`loom--initialized`, schedulers, etc.).
-- Starts timers (`loom--health-check-timer`).
-- Starts threads and processes via `loom:ipc-init` and `loom:poll`.
-- May create files on the filesystem via `loom:ipc-init`.
-
-Signals:
-- `loom-initialization-error`: On a non-recoverable failure during setup.
-  If this occurs, the function will attempt to clean up any partially
-  initialized resources before signaling."
-  (unless loom--initialized
-    (loom-log :info nil "Initializing Loom library.")
-    (condition-case err
-        (progn
-          ;; Initialize subsystems in order of dependency.
-          (loom--init-schedulers)
-          (loom:ipc-init :my-id my-id
-                         :target-instance-id target-instance-id
-                         :listen-for-incoming-p listen-for-incoming-p)
-          (when (fboundp 'make-thread)
-            (loom:poll-ensure-scheduler-thread))
-          (loom--start-health-check-timer)
-
-          ;; Mark initialization as complete.
-          (setq loom--initialized t)
-          (loom-log :info nil "Loom library initialized successfully."))
-      ;; If any step of the initialization fails...
-      (error
-       (loom-log :error nil "Loom initialization failed: %S" err)
-       ;; ...attempt to clean up any resources that may have been
-       ;; partially initialized to leave the system in a clean state.
-       (loom:shutdown)
-       ;; ...and signal a specific error to the caller.
-       (signal 'loom-initialization-error `("Library init failed" ,err))))))
-
-;;;###autoload
-(defun loom:shutdown ()
-  "Shut down the Loom library and clean up all allocated resources.
-This function is designed to be robust and idempotent. It systematically
-shuts down each subsystem, wrapping each step in a `condition-case` so that
-a failure in one part does not prevent the cleanup of others. It is
-automatically registered with `kill-emacs-hook` to run when Emacs exits.
+Arguments: None.
+(Removed :my-id and :listen-for-incoming-p, as these are IPC concerns)
 
 Returns: `nil`.
 
 Side Effects:
-- Stops all timers, threads, and processes started by Loom.
-- Cleans up IPC resources, including deleting FIFO files.
-- Resets all global state variables to `nil`."
+- Modifies global state variables (`loom--initialized`, schedulers, etc.).
+- Starts core timers (`loom--health-check-timer`).
+- Initializes `loom-scheduler` and `loom-microtask` components.
+- Runs `loom-config-post-init-hook` for external module initialization.
+
+Signals:
+- `loom-initialization-error`: On a non-recoverable failure during
+  core Loom setup."
+  (unless loom--initialized
+    (loom:log! :info 'loom-config "Initializing Loom core library.")
+    (condition-case err
+        (progn
+          ;; 1. Initialize core schedulers (fundamental to Loom's operation).
+          (loom--scheduler-init-core-schedulers)
+
+          ;; 2. Start optional core health check timer.
+          (loom--health-check-start-timer)
+
+          ;; 3. Mark core initialization as complete.
+          (setq loom--initialized t)
+          (loom:log! :info 'loom-config
+                     "Loom core library initialized successfully.")
+
+          ;; 4. Run post-initialization hooks for external modules.
+          ;; This is where modules like 'warp' would plug in their IPC,
+          ;; distributed logging, or threading setup.
+          (run-hooks 'loom-config-post-init-hook)
+
+          ;; 5. Optionally start the profiler if configured.
+          (when loom-profiler-autostart-features
+            (loom:log! :info 'loom-config
+                       "Auto-starting profiler for features: %s"
+                       loom-profiler-autostart-features)
+            (loom:profiler-start :interval
+                                 loom-profiler-autostart-interval)
+            (dolist (feature loom-profiler-autostart-features)
+              (loom:profiler-instrument-feature feature))))
+      ;; If any step of the initialization fails...
+      (error
+       (loom:log! :error 'loom-config "Loom core initialization failed: %S" err)
+       ;; ...attempt to clean up any resources that may have been
+       ;; partially initialized to leave the system in a clean state.
+       (loom:shutdown)
+       ;; ...and signal a specific error to the caller.
+       (signal 'loom-initialization-error
+               `("Core library init failed" ,err))))))
+
+;;;###autoload
+(defun loom:shutdown ()
+  "Shuts down the Loom core library and cleans up all allocated resources.
+
+This function is designed to be robust and idempotent. It systematically
+shuts down each core Loom subsystem, wrapping each step in a
+`condition-case` so that a failure in one part does not prevent the
+cleanup of others. It is automatically registered with `kill-emacs-hook`
+to run when Emacs exits, ensuring graceful resource release.
+
+Arguments: None.
+
+Returns: `nil`.
+
+Side Effects:
+- Runs `loom-config-pre-shutdown-hook` for external module cleanup.
+- Stops all timers managed by `loom-config`.
+- Stops and uninitializes core schedulers.
+- Cleans up `loom-profiler` if it was active.
+- Resets all global state variables (`loom--initialized`, schedulers) to `nil`.
+- Can log errors if any cleanup step fails."
   (when loom--initialized
-    (loom-log :info nil "Shutting down Loom library.")
-    ;; The unwind-protect ensures that the final state variables are reset
-    ;; even if the cleanup process itself encounters an error.
+    (loom:log! :info 'loom-config "Shutting down Loom core library.")
     (unwind-protect
         (progn
-          ;; The following cleanup steps are individually wrapped to maximize
-          ;; the chance of a complete shutdown.
+          ;; 1. Run pre-shutdown hooks for external modules.
+          ;; This is where modules like 'warp' would plug in their IPC,
+          ;; distributed logging, or threading cleanup.
+          (run-hooks 'loom-config-pre-shutdown-hook)
 
-          ;; Stop and clean up the health check timer
-          (loom--stop-health-check-timer)
+          ;; 2. Stop the profiler if it was running.
+          (condition-case e (loom:profiler-stop)
+            (error (loom:log! :error 'loom-config
+                              "Profiler stop error: %S" e)))
 
-          ;; 1. Signal the generic thread polling scheduler to stop.
-          (condition-case e (loom:poll-stop-scheduler-thread)
-            (error (loom-log :error nil "Polling scheduler stop error: %S" e)))
+          ;; 3. Stop core health check timer.
+          (loom--health-check-stop-timer)
 
-          ;; 2. Clean up IPC resources (e.g., kill the pipe process).
-          (condition-case e (loom:ipc-cleanup)
-            (error (loom-log :error nil "IPC cleanup error: %S" e)))
-
-          ;; 3. Stop and reset the macrotask scheduler.
+          ;; 4. Stop macrotask scheduler. Microtask queue usually doesn't
+          ;; need an explicit stop beyond clearing its global variable.
           (when loom--macrotask-scheduler
             (condition-case e (loom:scheduler-stop loom--macrotask-scheduler)
-              (error (loom-log :error nil
-                               "Macrotask scheduler stop error: %S" e)))))
-      ;; This `progn` block is the cleanup form of unwind-protect. It
-      ;; will run no matter what happens above.
+              (error (loom:log! :error 'loom-config
+                                "Macrotask scheduler stop error: %S" e)))))
+      ;; Ensure all global state is reset even if errors occur during cleanup.
       (progn
         (setq loom--macrotask-scheduler nil)
         (setq loom--microtask-scheduler nil)
         (setq loom--initialized nil)
-        (loom-log :info nil "Loom library shutdown complete.")))))
+        (loom:log! :info 'loom-config "Loom core library shutdown complete.")))))
 
-;; Hook into Emacs shutdown to ensure graceful resource cleanup. This is crucial
-;; for preventing orphaned processes or timers when Emacs is closed.
+;; Hook into Emacs shutdown to ensure graceful resource cleanup.
+;; This function will run when Emacs exits.
 (add-hook 'kill-emacs-hook #'loom:shutdown)
 
 (provide 'loom-config)

@@ -15,7 +15,7 @@
 
 (require 'cl-lib)
 
-(require 'loom-errors)
+(require 'loom-error)
 (require 'loom-lock)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -29,6 +29,10 @@
   "An operation was attempted on an invalid queue object."
   'loom-queue-error)
 
+(define-error 'loom-queue-full-error-type
+  "An attempt was made to enqueue an item to a full queue."
+  'loom-queue-error)
+
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Struct Definitions
 
@@ -36,28 +40,29 @@
   "Represents a single node in the queue's internal linked list.
 
 Fields:
-- `data` (any): The value stored in this node.
-- `next` (loom-queue-node or nil): A pointer to the next node in the
-  queue, or `nil` if this is the last node."
+- `data`: The value stored in this node.
+- `next`: A pointer to the next node in the queue, or `nil` if this
+  is the last node."
   data
-  (next nil :type (or null loom-queue-node))) 
+  (next nil :type (or null loom-queue-node)))
 
 (cl-defstruct (loom-queue (:constructor %%make-queue))
   "A thread-safe FIFO queue using explicit head and tail pointers.
 
 Fields:
-- `head` (loom-queue-node): The first node in the queue, from which
-  items are dequeued.
-- `tail` (loom-queue-node): The last node in the queue, to which new
-  items are enqueued.
-- `lock` (loom-lock): A mutex that protects all queue operations,
-  ensuring thread-safety.
-- `count` (integer): The number of items currently in the queue, allowing
-  for O(1) length checks."
-  (head nil :type (or null loom-queue-node)) 
-  (tail nil :type (or null loom-queue-node)) 
+- `head`: The first node in the queue, from which items are dequeued.
+- `tail`: The last node in the queue, to which new items are enqueued.
+- `lock`: A mutex that protects all queue operations, ensuring
+  thread-safety.
+- `count`: The number of items currently in the queue, allowing for O(1)
+  length checks.
+- `max-size`: The maximum number of items the queue can hold. `nil`
+  means no size limit."
+  (head nil :type (or null loom-queue-node))
+  (tail nil :type (or null loom-queue-node))
   (lock (loom:lock) :type loom-lock)
-  (count 0 :type integer))
+  (count 0 :type integer)
+  (max-size nil :type (or null integer)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Internal Helpers
@@ -67,7 +72,8 @@ Fields:
 
 Arguments:
 - `QUEUE` (any): The object to validate.
-- `FUNCTION-NAME` (symbol): The calling function's name for error reporting."
+- `FUNCTION-NAME` (symbol): The calling function's name for error
+  reporting."
   (unless (loom-queue-p queue)
     (signal 'loom-invalid-queue-error
             (list (format "%s: Invalid queue object" function-name) queue))))
@@ -87,14 +93,37 @@ This must be called from within a context that already holds the lock."
 ;;; Public API
 
 ;;;###autoload
-(defun loom:queue ()
+(cl-defun loom:queue (&key (max-size nil) (name nil))
   "Create a new, empty, thread-safe queue.
+
+Arguments:
+- `:max-size` (integer or nil, optional): The maximum capacity of the
+  queue. If `nil`, the queue has no size limit.
+- `:name` (string, optional): A descriptive name for the queue's
+  internal lock.
 
 Returns:
 - (loom-queue): A new `loom-queue` instance."
-  (let* ((name (format "queue-lock-%S" (gensym)))
-         (queue (%%make-queue :lock (loom:lock name))))
+  (let* ((lock-name (or name (format "queue-lock-%S" (gensym))) )
+         (queue (%%make-queue :lock (loom:lock lock-name)
+                              :max-size max-size)))
     queue))
+
+;;;###autoload
+(defun loom:queue-full-error (queue)
+  "Signal a `loom-queue-full-error-type` indicating the queue is full.
+
+Arguments:
+- `QUEUE` (loom-queue): The queue that is full.
+
+Returns: (void)
+
+Signals:
+- `loom-queue-full-error-type`"
+  (signal 'loom-queue-full-error-type
+          (format "Queue '%s' is full (max size: %d)"
+                  (loom-lock-name (loom-queue-lock queue))
+                  (loom-queue-max-size queue))))
 
 ;;;###autoload
 (defun loom:queue-enqueue (queue item)
@@ -106,9 +135,16 @@ Arguments:
 - `ITEM` (any): The item to add.
 
 Returns:
-- The enqueued `ITEM`."
+- The enqueued `ITEM`.
+
+Signals:
+- `loom-queue-full-error-type` if the queue has a `max-size` and is
+  full."
   (loom--validate-queue queue 'loom:queue-enqueue)
   (loom:with-mutex! (loom-queue-lock queue)
+    (when (and (loom-queue-max-size queue)
+               (>= (loom-queue-count queue) (loom-queue-max-size queue)))
+      (loom:queue-full-error queue)) ; Call the new error function
     (let ((new-node (%%make-queue-node :data item)))
       (if (zerop (loom-queue-count queue))
           (setf (loom-queue-head queue) new-node
@@ -129,9 +165,16 @@ Arguments:
 - `ITEM` (any): The item to add to the front.
 
 Returns:
-- The enqueued `ITEM`."
+- The enqueued `ITEM`.
+
+Signals:
+- `loom-queue-full-error-type` if the queue has a `max-size` and is
+  full."
   (loom--validate-queue queue 'loom:queue-enqueue-front)
   (loom:with-mutex! (loom-queue-lock queue)
+    (when (and (loom-queue-max-size queue)
+               (>= (loom-queue-count queue) (loom-queue-max-size queue)))
+      (loom:queue-full-error queue)) ; Call the new error function
     (let ((new-node (%%make-queue-node :data item)))
       (if (zerop (loom-queue-count queue))
           (setf (loom-queue-head queue) new-node
@@ -227,9 +270,9 @@ Returns:
 ;;;###autoload
 (cl-defun loom:queue-remove-if (queue predicate)
   "Remove all items from `QUEUE` for which `PREDICATE` returns non-nil.
-The `PREDICATE` function is called with one argument: the item in the queue.
-Time complexity: O(n) due to the linear traversal. This operation is
-thread-safe.
+The `PREDICATE` function is called with one argument: the item in the
+queue. Time complexity: O(n) due to the linear traversal. This
+operation is thread-safe.
 
 Arguments:
 - `QUEUE` (loom-queue): The queue instance.
@@ -276,7 +319,7 @@ Returns:
             (setq prev curr
                   curr (loom-queue-node-next curr)))))
     removed-count)))
-    
+
 ;;;###autoload
 (defun loom:queue-length (queue)
   "Return the number of items in `QUEUE`.
@@ -316,7 +359,8 @@ Returns:
   (loom--validate-queue queue 'loom:queue-status)
   (loom:with-mutex! (loom-queue-lock queue)
     `(:length ,(loom-queue-count queue)
-      :is-empty ,(zerop (loom-queue-count queue)))))
+      :is-empty ,(zerop (loom-queue-count queue))
+      :max-size ,(loom-queue-max-size queue))))
 
 (provide 'loom-queue)
 ;;; loom-queue.el ends here

@@ -31,7 +31,7 @@
 (require 'subr-x)
 
 (require 'loom-log)
-(require 'loom-errors)
+(require 'loom-error)
 (require 'loom-lock)
 (require 'loom-queue)
 (require 'loom-promise)
@@ -135,7 +135,7 @@ Returns: `nil`.
 
 Signals: `loom-invalid-semaphore-error`."
   (unless (loom-semaphore-p sem)
-    (loom-log :error function-name "Invalid semaphore object: %S" sem)
+    (loom:log! :error function-name "Invalid semaphore object: %S" sem)
     (signal 'loom-invalid-semaphore-error
             (list (format "%s: Invalid semaphore object" function-name) sem))))
 
@@ -151,7 +151,7 @@ Returns: `nil`.
 Signals: `loom-semaphore-closed-error`."
   (loom--validate-semaphore sem function-name)
   (when (loom-semaphore-closed-p sem)
-    (loom-log :warn function-name "Semaphore '%s' is closed."
+    (loom:log! :warn function-name "Semaphore '%s' is closed."
               (loom-semaphore-name sem))
     (signal 'loom-semaphore-closed-error
             (list (format "%s: Semaphore '%s' is closed"
@@ -168,7 +168,7 @@ Returns: `nil`.
 
 Signals: `loom-semaphore-permit-error`."
   (unless (and (integerp n) (> n 0) (<= n *loom-semaphore-max-permits*))
-    (loom-log :error function-name "Invalid permit count %S" n)
+    (loom:log! :error function-name "Invalid permit count %S" n)
     (signal 'loom-semaphore-permit-error
             (list (format "%s: Invalid permit count %S (must be 1-%d)"
                           function-name n *loom-semaphore-max-permits*)))))
@@ -222,7 +222,7 @@ Signals:
     (puthash :creation-time (float-time) (loom-semaphore-stats sem))
     ;; Track the new semaphore for automatic cleanup.
     (push sem loom--all-semaphores)
-    (loom-log :info sem-name "Created semaphore with %d permits." n)
+    (loom:log! :info sem-name "Created semaphore with %d permits." n)
     sem))
 
 ;;;###autoload
@@ -251,9 +251,9 @@ Signals:
         (loom--update-semaphore-stats sem permits nil)
         (setq acquired-p t)))
     (if acquired-p
-        (loom-log :debug (loom-semaphore-name sem)
+        (loom:log! :debug (loom-semaphore-name sem)
                   "Acquired %d permits (non-blocking)." permits)
-      (loom-log :debug (loom-semaphore-name sem)
+      (loom:log! :debug (loom-semaphore-name sem)
                 "Failed to acquire %d permits (non-blocking), %d available."
                 permits (loom-semaphore-count sem)))
     acquired-p))
@@ -292,7 +292,7 @@ Signals:
             (cl-decf (loom-semaphore-count sem) permits)
             (loom--update-semaphore-stats sem permits nil)
             (setq acquire-promise (loom:resolved! permits))
-            (loom-log :debug (loom-semaphore-name sem)
+            (loom:log! :debug (loom-semaphore-name sem)
                       "Acquired %d permits (immediate)." permits))
         ;; Case 2: Not enough permits, must wait.
         (let* ((stats (loom-semaphore-stats sem))
@@ -305,7 +305,7 @@ Signals:
           (loom:queue-enqueue (loom-semaphore-wait-queue sem) waiter)
           (puthash :total-waiters (1+ (gethash :total-waiters stats 0)) stats)
           (setq acquire-promise waiter-promise)
-          (loom-log :debug (loom-semaphore-name sem)
+          (loom:log! :debug (loom-semaphore-name sem)
                     "Queued for %d permits." permits)
 
           ;; If a cancel token is provided, set up a callback to remove the
@@ -315,7 +315,7 @@ Signals:
              cancel-token
              (lambda (_reason)
                (loom:with-mutex! (loom-semaphore-lock sem)
-                 (loom-log :debug (loom-semaphore-name sem)
+                 (loom:log! :debug (loom-semaphore-name sem)
                            "Cancel token triggered for waiter of %d permits."
                            permits)
                  (loom:queue-remove-if (loom-semaphore-wait-queue sem)
@@ -353,7 +353,7 @@ Signals:
       ;; 1. Check for capacity errors.
       (when (> (+ (loom-semaphore-count sem) permits)
                (loom-semaphore-max-count sem))
-        (loom-log :error (loom-semaphore-name sem)
+        (loom:log! :error (loom-semaphore-name sem)
                   "Release of %d permits would exceed capacity of %d."
                   permits (loom-semaphore-max-count sem))
         (signal 'loom-semaphore-capacity-error
@@ -363,7 +363,7 @@ Signals:
       ;; 2. Add the released permits and update stats.
       (cl-incf (loom-semaphore-count sem) permits)
       (loom--update-semaphore-stats sem nil permits)
-      (loom-log :debug (loom-semaphore-name sem)
+      (loom:log! :debug (loom-semaphore-name sem)
                 "Released %d permits. Available: %d."
                 permits (loom-semaphore-count sem))
 
@@ -374,18 +374,18 @@ Signals:
                        (loom:queue-peek (loom-semaphore-wait-queue sem)))))
         (let* ((waiter (loom:queue-dequeue (loom-semaphore-wait-queue sem)))
                (needed-permits (loom-semaphore-waiter-permits waiter)))
-          (unless (loom:cancelled-p (loom-semaphore-waiter-promise waiter))
+          (unless (loom:promise-cancelled-p (loom-semaphore-waiter-promise waiter))
             (cl-decf (loom-semaphore-count sem) needed-permits)
             (loom--update-semaphore-stats sem needed-permits nil)
             (push waiter satisfied-waiters)))))
 
     ;; 4. Resolve promises for satisfied waiters outside the lock.
     (dolist (waiter satisfied-waiters)
-      (loom-log :debug (loom-semaphore-name sem)
+      (loom:log! :debug (loom-semaphore-name sem)
                 "Satisfying waiter for %d permits."
                 (loom-semaphore-waiter-permits waiter))
-      (loom:resolve (loom-semaphore-waiter-promise waiter)
-                    (loom-semaphore-waiter-permits waiter)))
+      (loom:promise-resolve (loom-semaphore-waiter-promise waiter)
+                            (loom-semaphore-waiter-permits waiter)))
     nil))
 
 ;;;###autoload
@@ -448,7 +448,7 @@ Signals:
         (setf (loom-semaphore-count sem) 0)
         (loom--update-semaphore-stats sem drained-permits nil)))
     (when (> drained-permits 0)
-      (loom-log :info (loom-semaphore-name sem)
+      (loom:log! :info (loom-semaphore-name sem)
                 "Drained %d permits." drained-permits))
     drained-permits))
 
@@ -477,17 +477,17 @@ Signals:
               (loom:queue-drain (loom-semaphore-wait-queue sem)))))
 
     (dolist (waiter waiters-to-reject)
-      (loom-log :debug (loom-semaphore-name sem)
+      (loom:log! :debug (loom-semaphore-name sem)
                 "Rejecting waiter for %d permits due to closure."
                 (loom-semaphore-waiter-permits waiter))
-      (loom:reject (loom-semaphore-waiter-promise waiter)
-                   (loom:make-error 
-                    :type :loom-semaphore-closed-error
-                    :message (format "Semaphore '%s' was closed"
-                              (loom-semaphore-name sem)))))
+      (loom:promise-reject (loom-semaphore-waiter-promise waiter)
+                           (loom:error! 
+                            :type :loom-semaphore-closed-error
+                            :message (format "Semaphore '%s' was closed"
+                                      (loom-semaphore-name sem)))))
 
     (when waiters-to-reject
-      (loom-log :info (loom-semaphore-name sem)
+      (loom:log! :info (loom-semaphore-name sem)
                 "Closed semaphore, rejected %d waiters."
                 (length waiters-to-reject)))
     (length waiters-to-reject)))
@@ -509,7 +509,7 @@ Side Effects:
 Signals:
 - `loom-invalid-semaphore-error`."
   (loom--validate-semaphore sem 'loom:semaphore-cleanup)
-  (loom-log :info (loom-semaphore-name sem) "Cleaning up semaphore.")
+  (loom:log! :info (loom-semaphore-name sem) "Cleaning up semaphore.")
   (loom:semaphore-close sem)
   (setq loom--all-semaphores (delete sem loom--all-semaphores))
   (setf (loom-semaphore-lock sem) nil
@@ -535,14 +535,14 @@ Side Effects:
 
 Signals: `loom-invalid-semaphore-error`."
   (loom--validate-semaphore sem 'loom:semaphore-reset)
-  (loom-log :info (loom-semaphore-name sem) "Attempting to reset semaphore.")
+  (loom:log! :info (loom-semaphore-name sem) "Attempting to reset semaphore.")
   (loom:semaphore-close sem)
   (loom:with-mutex! (loom-semaphore-lock sem)
     (setf (loom-semaphore-count sem) (loom-semaphore-max-count sem)
           (loom-semaphore-closed-p sem) nil)
     (clrhash (loom-semaphore-stats sem))
     (puthash :creation-time (float-time) (loom-semaphore-stats sem)))
-  (loom-log :info (loom-semaphore-name sem) "Reset semaphore complete.")
+  (loom:log! :info (loom-semaphore-name sem) "Reset semaphore complete.")
   nil)
 
 ;;;###autoload
@@ -625,7 +625,7 @@ Side Effects: Prints information to the *Messages* buffer."
 (defun loom--semaphore-shutdown-hook ()
   "Clean up all active `loom-semaphore` instances on Emacs shutdown."
   (when loom--all-semaphores
-    (loom-log :info "Global" "Emacs shutdown: Cleaning up %d active semaphore(s)."
+    (loom:log! :info "Global" "Emacs shutdown: Cleaning up %d active semaphore(s)."
               (length loom--all-semaphores))
     ;; Iterate over a copy, as `loom:semaphore-cleanup` modifies the list.
     (dolist (sem (copy-sequence loom--all-semaphores))

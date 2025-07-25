@@ -1,49 +1,48 @@
-;;; loom-lock.el --- Mutual Exclusion Locks for Loom
-;;; -*- lexical-binding: t; -*-
+;;; loom-lock.el --- Mutual Exclusion Locks for Loom -*- lexical-binding: t; -*-
 
 ;;; Commentary:
 ;;
-;; This module provides the `loom-lock` (mutex) primitive, a cornerstone for
-;; safe concurrent programming in Emacs. It offers a unified, robust
-;; interface that abstracts over Emacs's diverse concurrency models, ensuring
-;; thread-safe operations in both cooperative and preemptive environments.
+;; This module provides the `loom-lock` (mutex) primitive, a
+;; cornerstone for safe concurrent programming in Emacs. It offers a
+;; unified, robust interface that abstracts over Emacs's diverse
+;; concurrency models, ensuring thread-safe operations.
 ;;
 ;; ## Key Features
 ;;
-;; - **Unified Concurrency Model:** Provides a single `loom-lock` object that
-;;   adapts its behavior based on the specified `:mode`.
+;; - **Unified Concurrency Model:** Provides a single `loom-lock` object
+;;   that adapts its behavior based on the specified `:mode`.
 ;;
 ;; - **Cooperative Locks (`:deferred`, `:process`):** For single-threaded
-;;   asynchronous operations. These locks are reentrant for the same owner
-;;   and use a polling-based acquisition strategy with backoff for contention.
-;;   They are designed to prevent blocking the main Emacs UI thread.
+;;   asynchronous operations. These locks are reentrant for the same
+;;   owner and use a polling-based acquisition strategy with backoff
+;;   for contention. They prevent blocking the main Emacs UI thread.
 ;;
-;; - **Native Thread Locks (`:thread`):** For preemptive thread-safety in
-;;   multi-threaded Emacs builds. This mode wraps Emacs's native `mutex`
-;;   for maximum efficiency and correctness. It is blocking and implicitly
-;;   reentrant as per the underlying Emacs implementation.
+;; - **Native Thread Locks (`:thread`):** For preemptive thread-safety
+;;   in multi-threaded Emacs builds. This mode wraps Emacs's native
+;;   `mutex` for maximum efficiency and correctness. It is blocking
+;;   and implicitly reentrant.
 ;;
-;; - **Safe Usage Macros:** The `loom:with-mutex!` macro is the recommended
-;;   way to use locks. It guarantees that a lock is always released, even
-;;   if an error occurs within the critical section, preventing deadlocks.
+;; - **Safe Usage Macros:** The `loom:with-mutex!` macro is the
+;;   recommended way to use locks. It guarantees a lock is always
+;;   released, even if an error occurs, preventing deadlocks.
 ;;
-;; - **Timeout Support:** `loom:with-mutex-timeout!` allows acquiring a lock
-;;   with a timeout, preventing indefinite blocking in contented scenarios.
+;; - **Timeout Support:** `loom:with-mutex-timeout!` allows acquiring a
+;;   lock with a timeout, preventing indefinite blocking.
 ;;
-;; - **Comprehensive Monitoring:** When enabled via `defcustom`, the module
-;;   tracks detailed performance statistics for each lock, including
-;;   acquisition counts, contention rates, and hold times.
+;; - **Comprehensive Monitoring:** When enabled via `defcustom`, the
+;;   module tracks detailed performance statistics for each lock,
+;;   including acquisition counts, contention rates, and hold times.
 ;;
 ;; - **Graceful Degradation:** Automatically falls back from `:thread` to
-;;   `:deferred` mode if native threading support is unavailable in the
-;;   current Emacs instance, ensuring code portability.
+;;   `:deferred` mode if native threading support is unavailable,
+;;   ensuring code portability.
 
 ;;; Code:
 
 (require 'cl-lib)
 (require 'subr-x)
 
-(require 'loom-errors)
+(require 'loom-error)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Customization and Constants
@@ -64,9 +63,9 @@ circular dependencies, primarily through timeout mechanisms."
 
 (defcustom loom-lock-enable-performance-tracking t
   "Enable performance tracking for lock operations.
-When enabled, the system collects timing statistics for lock acquisitions,
-releases, and contention events. This can be useful for performance
-tuning but adds a small amount of overhead."
+When enabled, the system collects timing statistics for lock
+acquisitions, releases, and contention events. This can be useful
+for performance tuning but adds a small amount of overhead."
   :type 'boolean
   :group 'loom)
 
@@ -116,8 +115,7 @@ acquired."
 
 (defvar loom--lock-global-stats (make-hash-table :test 'equal)
   "A global hash table for tracking performance statistics of all locks.
-The keys are lock names (strings), and the values are plists containing
-various metrics like acquisition counts, contention rates, and hold times.")
+Keys are lock names (strings), values are plists of various metrics.")
 
 (defun loom--lock-init-stats (lock)
   "Initializes the statistics tracking entry for a given `LOCK`.
@@ -142,7 +140,7 @@ This is a no-op if `loom-lock-enable-performance-tracking` is `nil`.
 Arguments:
 - `LOCK` (loom-lock): The lock whose stats to update.
 - `STAT-TYPE` (keyword): The statistic to update (e.g., `:acquisition`).
-- `VALUE` (any, optional): The value for the update (e.g., hold time duration).
+- `VALUE` (any, optional): The value for the update (e.g., hold time).
 
 Returns: `nil`.
 Side Effects: Modifies the statistics plist for the lock."
@@ -165,7 +163,7 @@ Side Effects: Modifies the statistics plist for the lock."
 
 Returns:
 - (hash-table): A copy of the global statistics hash table, preventing
-  accidental modification of the internal state. Keys are lock names, and
+  accidental modification of the internal state. Keys are lock names,
   values are plists of performance metrics."
   (copy-hash-table loom--lock-global-stats))
 
@@ -173,19 +171,16 @@ Returns:
 ;;; Struct Definitions
 
 (cl-defstruct (loom-lock (:constructor %%make-lock))
-  "A mutual exclusion lock (mutex) with support for multiple concurrency models.
+  "A mutual exclusion lock (mutex) with comprehensive concurrency models.
 
 Fields:
-- `name` (string): A descriptive name for debugging, logging, and statistics.
+- `name` (string): A descriptive name for debugging and statistics.
 - `mode` (symbol): The operating mode: `:deferred`, `:thread`, or `:process`.
-- `locked-p` (boolean): The primary lock state flag for cooperative modes.
-- `native-mutex` (mutex): The underlying native Emacs mutex, used only in
-  `:thread` mode.
-- `owner` (any): Identifier for the current lock holder. In `:thread` mode,
-  this is a thread object; in cooperative modes, it's a generic identifier
-  (often `t`).
+- `locked-p` (boolean): The primary lock state for cooperative modes.
+- `native-mutex` (mutex): The underlying native Emacs mutex for `:thread`.
+- `owner` (any): Identifier for the current lock holder.
 - `reentrant-count` (integer): The nested acquisition count for reentrancy.
-- `acquisition-timeout` (float): The default timeout in seconds for acquisition."
+- `acquisition-timeout` (float): Default timeout for acquisition."
   (name "" :type string)
   (mode :deferred :type symbol)
   (locked-p nil :type boolean)
@@ -202,7 +197,7 @@ Fields:
 
 Arguments:
 - `LOCK` (any): The object to validate.
-- `FUNCTION-NAME` (symbol): The calling function's name for error reporting.
+- `FUNCTION-NAME` (symbol): The calling function's name for error.
 
 Returns: `nil`.
 Signals: `loom-invalid-lock-error` if `LOCK` is invalid."
@@ -213,10 +208,7 @@ Signals: `loom-invalid-lock-error` if `LOCK` is invalid."
 
 (defun loom--lock-get-effective-owner (lock &optional owner)
   "Determines the effective owner for a lock operation.
-This abstracts the difference between thread identity and the main process
-identity. If `OWNER` is not specified, it defaults to the `current-thread`
-for `:thread` mode, or a generic `t` for cooperative modes (representing the
-main Emacs process).
+Defaults to `current-thread` for `:thread` or `t` for cooperative modes.
 
 Arguments:
 - `LOCK` (loom-lock): The lock in question.
@@ -229,7 +221,7 @@ Returns: The effective owner identifier."
         ((or :deferred :process) t))))
 
 (defun loom--lock-check-threading-support ()
-  "Checks if native threading support is available in the current Emacs build.
+  "Checks if native threading support is available.
 Returns: `t` if `make-mutex` and `current-thread` exist, `nil` otherwise."
   (and (fboundp 'make-mutex) (fboundp 'current-thread)))
 
@@ -238,17 +230,17 @@ Returns: `t` if `make-mutex` and `current-thread` exist, `nil` otherwise."
 This is a hook point for higher-level monitoring tools.
 
 Arguments:
-- `ACTION` (keyword): The action being performed (e.g., `:acquire`, `:release`).
+- `ACTION` (keyword): The action being performed (e.g., `:acquire`).
 - `LOCK` (loom-lock): The lock involved in the action.
 
 Returns: `nil`.
-Side Effects: Calls the function in `loom-resource-tracking-function` if set."
+Side Effects: Calls the function in `loom-resource-tracking-function`."
   (when (and (fboundp 'loom-resource-tracking-function)
              (symbol-value 'loom-resource-tracking-function))
     (condition-case err
         (funcall (symbol-value 'loom-resource-tracking-function) action lock)
       (error
-       (message
+       (loom:log! :error (loom-lock-name lock)
                  "Resource tracking function failed: %S" err)))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -256,14 +248,12 @@ Side Effects: Calls the function in `loom-resource-tracking-function` if set."
 
 (defun loom--lock-acquire-cooperative (lock owner timeout)
   "Acquires a cooperative lock with timeout support.
-This function implements the cooperative locking logic, including reentrancy,
-contention detection, and polling with exponential backoff to avoid
-busy-waiting.
+Implements reentrancy, contention detection, and polling with backoff.
 
 Arguments:
 - `LOCK` (loom-lock): The cooperative lock to acquire.
 - `OWNER` (any): The identifier of the entity acquiring the lock.
-- `TIMEOUT` (number or nil): Maximum seconds to wait for the lock.
+- `TIMEOUT` (number or nil): Maximum seconds to wait.
 
 Returns: `t` if the lock was acquired successfully.
 Signals: `loom-lock-timeout-error` if acquisition times out."
@@ -271,7 +261,7 @@ Signals: `loom-lock-timeout-error` if acquisition times out."
         (acquired-p nil)
         (sleep-interval 0.001)) ; Start with 1ms polling interval.
 
-    ;; Loop until the lock is acquired or the timeout is exceeded.
+    ;; Loop until acquired or timeout.
     (while (and (not acquired-p)
                 (or (null timeout) (< (- (float-time) start-time) timeout)))
       (cond
@@ -288,31 +278,33 @@ Signals: `loom-lock-timeout-error` if acquisition times out."
         ;; Case 3: Lock is held by someone else (contention).
         (t
          (loom--lock-update-stats lock :contention)
-         ;; If a timeout is specified, wait for a short, increasing interval.
+         (loom:log! :debug (loom-lock-name lock)
+                   "Contention on lock '%s'. Owner: %S"
+                   (loom-lock-name lock) (loom-lock-owner lock))
+         ;; If timeout, wait for a short, increasing interval.
          (when timeout
            (sit-for (min sleep-interval
                          (- timeout (- (float-time) start-time))))
-           ;; Exponential backoff to reduce polling frequency under contention.
+           ;; Exponential backoff.
            (setq sleep-interval (min (* sleep-interval 1.5) 0.1))))))
 
-    ;; If the loop finished without acquiring the lock, it timed out.
+    ;; If timed out.
     (unless acquired-p
       (loom--lock-update-stats lock :timeout)
+      (loom:log! :warn (loom-lock-name lock)
+                "Lock acquisition for '%s' timed out after %.2fs seconds."
+                (loom-lock-name lock) timeout)
       (signal 'loom-lock-timeout-error
-              (list (format "Lock acquisition for '%s' timed out after %.2fs seconds"
+              (list (format "Lock acquisition for '%s' timed out after %.2fs"
                             (loom-lock-name lock) timeout))))
 
-    ;; (loom-log :debug (loom-lock-name lock)
-    ;;           "Lock acquired (reentrant count: %d)"
-    ;;           (loom-lock-reentrant-count lock))
     (loom--lock-update-stats lock :acquisition)
     (loom--lock-track-resource :acquire lock)
     t))
 
 (defun loom--lock-release-cooperative (lock owner)
   "Releases a cooperative lock.
-Decrements the reentrant count. The lock is only truly freed (unlocked)
-when the count reaches zero.
+Decrements the reentrant count. Lock is freed when count reaches zero.
 
 Arguments:
 - `LOCK` (loom-lock): The cooperative lock to release.
@@ -324,25 +316,26 @@ Signals:
 - `loom-lock-double-release-error`: If the lock is not currently held."
   ;; Check for releasing a lock that isn't held.
   (unless (loom-lock-locked-p lock)
+    (loom:log! :error (loom-lock-name lock)
+              "Attempted to release unheld lock '%s'." (loom-lock-name lock))
     (signal 'loom-lock-double-release-error
             (list (format "Cannot release lock '%s': it is not held"
                           (loom-lock-name lock)))))
   ;; Check for releasing a lock owned by someone else.
   (unless (equal (loom-lock-owner lock) owner)
+    (loom:log! :error (loom-lock-name lock)
+              "Attempted to release lock '%s' owned by %S with wrong owner %S."
+              (loom-lock-name lock) (loom-lock-owner lock) owner)
     (signal 'loom-lock-unowned-release-error
-            (list (format "Cannot release lock '%s' owned by %S (current owner: %S)"
+            (list (format "Cannot release lock '%s' owned by %S (current %S)"
                           (loom-lock-name lock) owner (loom-lock-owner lock)))))
 
   (cl-decf (loom-lock-reentrant-count lock))
-  ;; (loom-log :debug (loom-lock-name lock)
-  ;;           "Lock released (reentrant count: %d)"
-  ;;           (loom-lock-reentrant-count lock))
 
-  ;; If this was the last release in a nested chain, free the lock.
+  ;; If this was the last release, free the lock.
   (when (zerop (loom-lock-reentrant-count lock))
     (setf (loom-lock-owner lock) nil
           (loom-lock-locked-p lock) nil))
-    ;; (loom-log :debug (loom-lock-name lock) "Lock is now free."))
 
   (loom--lock-update-stats lock :release)
   (loom--lock-track-resource :release lock)
@@ -357,15 +350,13 @@ Signals:
   "Creates a new lock object (mutex) with comprehensive concurrency support.
 
 The lock's behavior depends on its `MODE`:
-- `:deferred` or `:process`: A cooperative, reentrant lock designed for
-  single-threaded asynchronous code. Uses polling, not blocking.
-- `:thread`: A native OS thread mutex for preemptive thread-safety. This
-  is a blocking lock and is only available in Emacs builds with thread support.
+- `:deferred` or `:process`: Cooperative, reentrant, polling-based.
+- `:thread`: Native OS thread mutex, blocking (Emacs with threads only).
 
 Arguments:
-- `NAME` (string or symbol): A descriptive name for debugging and statistics.
-- `:MODE` (symbol): The lock mode (`:deferred`, `:thread`, `:process`).
-- `:TIMEOUT` (float or nil): The default timeout in seconds for acquisitions.
+- `NAME` (string or symbol): Descriptive name for debugging.
+- `:MODE` (symbol): Lock mode (`:deferred`, `:thread`, `:process`).
+- `:TIMEOUT` (float or nil): Default timeout for acquisitions.
 
 Returns:
 - (loom-lock): A new lock object.
@@ -377,64 +368,60 @@ Signals: `loom-lock-invalid-mode-error` for unsupported modes."
 
   (let ((effective-mode mode)
         (lock-name (if (stringp name) name (format "%S" name))))
-    ;; Gracefully degrade from :thread to :deferred if threading is not
-    ;; supported.
+    ;; Gracefully degrade from :thread to :deferred if no threading.
     (when (and (eq mode :thread) (not (loom--lock-check-threading-support)))
-      (setq effective-mode :deferred))
-      ;; (loom-log :warn lock-name
-      ;;           "Native threading is unavailable; lock '%s' will fall back to :deferred mode."
-      ;;           lock-name))
+      (setq effective-mode :deferred)
+      (loom:log! :warn lock-name
+                "Native threading unavailable; lock '%s' falls back to :deferred."
+                lock-name))
 
     (let ((new-lock
            (%%make-lock :name lock-name
                         :mode effective-mode
-                        ;; Only create a native mutex if we are in :thread mode.
+                        ;; Only create native mutex if in :thread mode.
                         :native-mutex (and (eq effective-mode :thread)
                                            (make-mutex lock-name))
                         :acquisition-timeout timeout)))
       (loom--lock-init-stats new-lock)
-      ;; (loom-log :info lock-name "Lock created (mode: %s)" effective-mode)
+      (loom:log! :info lock-name "Lock '%s' created (mode: %s)"
+                lock-name effective-mode)
       new-lock)))
 
 ;;;###autoload
 (defun loom:lock-acquire (lock &optional owner timeout)
   "Acquires `LOCK` with optional timeout. **For cooperative locks only.**
-This function is intended for manual control of cooperative (`:deferred` or
-`:process` mode) locks. For `:thread` mode locks, direct acquisition is
-discouraged; prefer using the `loom:with-mutex!` macro for safe, automatic
-resource management.
+Manual control of cooperative (`:deferred` or `:process`) locks. For
+`:thread` locks, prefer `loom:with-mutex!` for safety.
 
 Arguments:
 - `LOCK` (loom-lock): The lock object to acquire.
-- `OWNER` (any, optional): Owner identifier. Defaults to the effective owner.
+- `OWNER` (any, optional): Owner identifier.
 - `TIMEOUT` (float, optional): Override timeout in seconds.
 
-Returns: `t` if the lock was successfully acquired.
-Signals:
-- `loom-invalid-lock-error`, `loom-lock-timeout-error`.
-- `error` if called on a `:thread` mode lock, as this is unsafe."
+Returns: `t` if acquired.
+Signals: `loom-invalid-lock-error`, `loom-lock-timeout-error`, or `error`
+  if called on a `:thread` lock (unsafe)."
   (loom--validate-lock lock 'loom:lock-acquire)
   (let ((effective-owner (loom--lock-get-effective-owner lock owner))
         (effective-timeout (or timeout (loom-lock-acquisition-timeout lock))))
     (pcase (loom-lock-mode lock)
       (:thread
-       (error "Direct acquire/release is discouraged for :thread locks. Use `loom:with-mutex!` instead."))
+       (error "Direct acquire/release is discouraged for :thread locks.
+Use `loom:with-mutex!` instead."))
       ((or :deferred :process)
        (loom--lock-acquire-cooperative lock effective-owner effective-timeout)))))
 
 ;;;###autoload
 (defun loom:lock-try-acquire (lock &optional owner)
-  "Attempts to acquire `LOCK` without blocking, returning immediately.
+  "Attempts to acquire `LOCK` without blocking, returns immediately.
 
 Arguments:
 - `LOCK` (loom-lock): The lock object.
 - `OWNER` (any, optional): Owner identifier.
 
-Returns: `t` if the lock was acquired, `nil` if it was already held by another
-owner.
+Returns: `t` if acquired, `nil` if already held by another owner.
 Signals: `loom-invalid-lock-error`, `loom-lock-unsupported-operation-error`
-  for `:thread` mode, as a native `mutex-trylock` is not a standard Emacs
-  feature."
+  for `:thread` mode (native `mutex-trylock` not standard)."
   (loom--validate-lock lock 'loom:lock-try-acquire)
   (let ((effective-owner (loom--lock-get-effective-owner lock owner)))
     (pcase (loom-lock-mode lock)
@@ -454,22 +441,23 @@ Signals: `loom-invalid-lock-error`, `loom-lock-unsupported-operation-error`
 
 ;;;###autoload
 (defun loom:lock-release (lock &optional owner)
-  "Releases `LOCK`. Must be called by the current owner. **For cooperative
-locks only.** For cooperative locks, this decrements the reentrant count.
-The lock is only fully released when the count becomes zero.
+  "Releases `LOCK`. Must be called by the current owner.
+**For cooperative locks only.** Decrements reentrant count. Lock fully
+released when count is zero.
 
 Arguments:
 - `LOCK` (loom-lock): The lock object to release.
-- `OWNER` (any, optional): Owner identifier. Must match the current owner.
+- `OWNER` (any, optional): Owner identifier. Must match current owner.
 
-Returns: `t` if the release was successful.
+Returns: `t` if successful.
 Signals: Errors for invalid lock, unowned release, double release, or if
   called on a `:thread` mode lock."
   (loom--validate-lock lock 'loom:lock-release)
   (let ((effective-owner (loom--lock-get-effective-owner lock owner)))
     (pcase (loom-lock-mode lock)
       (:thread
-       (error "Direct acquire/release is discouraged for :thread locks. Use `loom:with-mutex!` instead."))
+       (error "Direct acquire/release is discouraged for :thread locks.
+Use `loom:with-mutex!` instead."))
       ((or :deferred :process)
        (loom--lock-release-cooperative lock effective-owner)))))
 
@@ -479,20 +467,20 @@ Signals: Errors for invalid lock, unowned release, double release, or if
 
 Arguments:
 - `LOCK` (loom-lock): The lock object to check.
-- `OWNER` (any, optional): The owner to check. Defaults to the effective owner.
+- `OWNER` (any, optional): The owner to check.
 
-Returns: `t` if the lock is owned by the specified owner, `nil` otherwise.
+Returns: `t` if owned by specified owner, `nil` otherwise.
 Signals: `loom-invalid-lock-error`."
   (loom--validate-lock lock 'loom:lock-owned-p)
   (let ((effective-owner (loom--lock-get-effective-owner lock owner)))
     (pcase (loom-lock-mode lock)
       (:thread
-       ;; Use the native `mutex-owner` if available for the most accurate check.
+       ;; Use native `mutex-owner` if available.
        (and (loom-lock-native-mutex lock)
             (if (fboundp 'mutex-owner)
                 (equal (mutex-owner (loom-lock-native-mutex lock))
                        effective-owner)
-              ;; Fallback for older Emacs versions.
+              ;; Fallback for older Emacs.
               (equal (loom-lock-owner lock) effective-owner))))
       ((or :deferred :process)
        (and (loom-lock-locked-p lock)
@@ -505,13 +493,13 @@ Signals: `loom-invalid-lock-error`."
 Arguments:
 - `LOCK` (loom-lock): The lock object to check.
 
-Returns: `t` if the lock is currently held, `nil` otherwise.
+Returns: `t` if held, `nil` otherwise.
 Signals: `loom-invalid-lock-error`."
   (loom--validate-lock lock 'loom:lock-held-p)
   (pcase (loom-lock-mode lock)
     (:thread
      (and (loom-lock-native-mutex lock)
-          ;; `mutex-owner` is the most reliable check.
+          ;; `mutex-owner` is most reliable.
           (if (fboundp 'mutex-owner)
               (not (null (mutex-owner (loom-lock-native-mutex lock))))
             ;; Fallback check.
@@ -527,15 +515,15 @@ Arguments:
 - `LOCK` (loom-lock): The lock object.
 
 Returns:
-- (plist): A plist containing both current state (`:current-*`) and historical
-  performance metrics.
+- (plist): Plist of current state (`:current-*`) and historical metrics.
 
 Signals: `loom-invalid-lock-error`."
   (loom--validate-lock lock 'loom:lock-stats)
   (let ((stats (gethash (loom-lock-name lock) loom--lock-global-stats)))
     (unless stats
-      ;; (loom-log :warn (loom-lock-name lock)
-      ;;           "No statistics found for lock '%s'" (loom-lock-name lock))
+      (loom:log! :warn (loom-lock-name lock)
+                "No statistics found for lock '%s'. Is tracking enabled?"
+                (loom-lock-name lock))
       (setq stats '(:not-tracked t)))
     `(:name ,(loom-lock-name lock)
       :current-mode ,(loom-lock-mode lock)
@@ -547,28 +535,27 @@ Signals: `loom-invalid-lock-error`."
 ;;;###autoload
 (defmacro loom:with-mutex! (lock-form &rest body)
   "Executes `BODY` within a critical section guarded by a lock.
-This macro is the **recommended way to use locks**. It guarantees that the
-lock is always released, even if an error occurs within the `BODY`, by
-using an `unwind-protect` form.
+**Recommended way to use locks.** Guarantees lock release via
+`unwind-protect`.
 
 Arguments:
-- `LOCK-FORM` (form): A form that evaluates to a `loom-lock` object.
-- `BODY` (forms): The Lisp forms to execute while holding the lock.
+- `LOCK-FORM` (form): Evaluates to a `loom-lock` object.
+- `BODY` (forms): Lisp forms to execute while holding the lock.
 
-Returns: The value of the last form in `BODY`.
-Signals: `loom-invalid-lock-error`, `loom-lock-timeout-error`, or any
-  errors from `BODY` (which are propagated after cleanup)."
+Returns: Value of last form in `BODY`.
+Signals: `loom-invalid-lock-error`, `loom-lock-timeout-error`, or
+  errors from `BODY`."
   (declare (indent 1) (debug (form &rest form)))
   (let ((lock-var (gensym "lock-")))
     `(let ((,lock-var ,lock-form))
        (loom--validate-lock ,lock-var 'loom:with-mutex!)
        (pcase (loom-lock-mode ,lock-var)
          (:thread
-          ;; For :thread mode, delegate to the efficient and correct native `with-mutex`.
-          ;; We wrap it to add our own statistics tracking.
+          ;; For :thread mode, delegate to native `with-mutex`.
+          ;; Wrap to add statistics tracking.
           (let ((native-mutex (loom-lock-native-mutex ,lock-var)))
             (unless native-mutex
-              (error "Thread-mode lock '%S' has an uninitialized native mutex"
+              (error "Thread-mode lock '%S' has uninitialized native mutex"
                      (loom-lock-name ,lock-var)))
             (with-mutex native-mutex
               (unwind-protect
@@ -576,55 +563,53 @@ Signals: `loom-invalid-lock-error`, `loom-lock-timeout-error`, or any
                     (loom--lock-update-stats ,lock-var :acquisition)
                     (loom--lock-track-resource :acquire ,lock-var)
                     ,@body)
-                ;; This cleanup form runs when the lock is released.
+                ;; Cleanup runs when lock is released.
                 (loom--lock-update-stats ,lock-var :release)
                 (loom--lock-track-resource :release ,lock-var)))))
          ((or :deferred :process)
-          ;; For cooperative modes, we implement the acquire/release logic manually
-          ;; within an `unwind-protect` to ensure the lock is always released.
+          ;; For cooperative modes, manual acquire/release in unwind-protect.
           (let ((owner (loom--lock-get-effective-owner ,lock-var)))
             (unwind-protect
                 (progn
                   (loom:lock-acquire ,lock-var owner)
                   ,@body)
-              ;; This cleanup form runs on any exit, including non-local exits.
-              (loom:lock-release ,lock-var owner))))))))
+                ;; Cleanup runs on any exit.
+                (loom:lock-release ,lock-var owner))))))))
 
 ;;;###autoload
 (defmacro loom:with-mutex-try! (lock-form &rest body)
-  "Executes `BODY` if the lock can be acquired immediately without blocking.
-This is for cooperative locks only.
+  "Executes `BODY` if lock acquired immediately without blocking.
+For cooperative locks only.
 
 Arguments:
-- `LOCK-FORM` (form): A form that evaluates to a `loom-lock` object.
-- `BODY` (forms): The Lisp forms to execute if the lock is acquired.
+- `LOCK-FORM` (form): Evaluates to a `loom-lock` object.
+- `BODY` (forms): Lisp forms to execute if lock is acquired.
 
-Returns: The value of the last form in `BODY` if the lock was acquired, `nil`
-otherwise.
-Side Effects: May acquire and release the lock. Executes `BODY` on success."
+Returns: Value of last form in `BODY` if acquired, `nil` otherwise.
+Side Effects: May acquire and release lock. Executes `BODY` on success."
   (declare (indent 1) (debug (form &rest form)))
   (let ((lock-var (gensym "lock-"))
         (owner-var (gensym "owner-")))
     `(let ((,lock-var ,lock-form))
        (loom--validate-lock ,lock-var 'loom:with-mutex-try!)
        (let ((,owner-var (loom--lock-get-effective-owner ,lock-var)))
-         ;; Attempt to acquire the lock without blocking.
+         ;; Attempt to acquire without blocking.
          (when (loom:lock-try-acquire ,lock-var ,owner-var)
-           ;; If successful, execute the body within an unwind-protect.
+           ;; If successful, execute body in unwind-protect.
            (unwind-protect (progn ,@body)
              (loom:lock-release ,lock-var ,owner-var)))))))
 
 ;;;###autoload
 (defmacro loom:with-mutex-timeout! (lock-form timeout-form &rest body)
-  "Executes `BODY`, attempting to acquire the lock with a specific timeout.
-This is for cooperative locks only.
+  "Executes `BODY`, attempting to acquire lock with specific timeout.
+For cooperative locks only.
 
 Arguments:
-- `LOCK-FORM` (form): A form that evaluates to a `loom-lock` object.
-- `TIMEOUT-FORM` (form): A form that evaluates to the timeout in seconds.
-- `BODY` (forms): The Lisp forms to execute if the lock is acquired.
+- `LOCK-FORM` (form): Evaluates to a `loom-lock` object.
+- `TIMEOUT-FORM` (form): Evaluates to timeout in seconds.
+- `BODY` (forms): Lisp forms to execute if lock acquired.
 
-Returns: The value of the last form in `BODY` if acquired.
+Returns: Value of last form in `BODY` if acquired.
 Signals: `loom-lock-timeout-error` if acquisition times out."
   (declare (indent 1) (debug (form form &rest form)))
   (let ((lock-var (gensym "lock-"))
@@ -634,24 +619,24 @@ Signals: `loom-lock-timeout-error` if acquisition times out."
             (,timeout-var ,timeout-form)
             (,owner-var (loom--lock-get-effective-owner ,lock-var)))
        (loom--validate-lock ,lock-var 'loom:with-mutex-timeout!)
-       ;; Attempt to acquire with a timeout. This will signal an error on failure.
+       ;; Attempt to acquire with a timeout. Signals error on failure.
        (when (loom:lock-acquire ,lock-var ,owner-var ,timeout-var)
          (unwind-protect (progn ,@body)
            (loom:lock-release ,lock-var ,owner-var))))))
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;-------------------------------------------------------------------
 ;;; Shutdown Hook
+;;;-------------------------------------------------------------------
 
 (defun loom--lock-shutdown-hook ()
-  "A shutdown hook to log final lock statistics and clean up global state.
-This is added to `kill-emacs-hook` to aid in debugging and resource analysis
-when Emacs is closing.
+  "Shutdown hook to log final lock statistics and clean up global state.
+Added to `kill-emacs-hook` for debugging and resource analysis on exit.
 
 Returns: `t`."
-  ;; (loom-log :info "Global" "Emacs shutdown: Finalizing lock module.")
-  ;; (when loom-lock-enable-performance-tracking
-  ;;   (loom-log :info "Global" "Final lock statistics dump: %S"
-  ;;             (loom:lock-global-stats)))
+  (loom:log! :info "loom-lock" "Emacs shutdown: Finalizing lock module.")
+  (when loom-lock-enable-performance-tracking
+    (loom:log! :info "loom-lock" "Final lock statistics dump: %S"
+              (loom:lock-global-stats)))
   ;; Clear the hash table to release memory.
   (clrhash loom--lock-global-stats)
   t)

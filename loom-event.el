@@ -37,7 +37,7 @@
 ;;                (lambda (config) (message "B: Init done with: %S" config)))
 ;;
 ;;   ;; Another task performs initialization and then sets the event
-;;   (loom:then (loom:delay 1) ; Simulate work
+;;   (loom:then (loom:delay! 1) ; Simulate work
 ;;                (lambda (_) (loom:event-set init-event '(:user "admin")))))
 
 ;;; Code:
@@ -45,7 +45,7 @@
 (require 'cl-lib)
 
 (require 'loom-log)
-(require 'loom-errors)
+(require 'loom-error)
 (require 'loom-lock)
 (require 'loom-queue)
 (require 'loom-promise)
@@ -76,7 +76,7 @@ properly cleaned up when Emacs exits.")
   'loom-event-error)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Data Structures
+;;; Struct Definitions
 
 (cl-defstruct (loom-event (:constructor %%make-event))
   "Represents a settable event for asynchronous task coordination.
@@ -174,7 +174,7 @@ Side Effects:
                               :wait-queue (loom:queue)
                               :creation-time (float-time))))
     (push event loom--all-events)
-    (loom-log :debug (loom-event-name event) "Created event.")
+    (loom:log! :debug (loom-event-name event) "Created event.")
     event))
 
 ;;;###autoload
@@ -248,13 +248,13 @@ Signals:
         (setq waiter-count (length waiters-to-resolve))
         (setq resolve-value (loom-event-value event))
         (cl-incf (loom-event-resolve-count event) waiter-count)
-        (loom-log :debug (loom-event-name event)
+        (loom:log! :debug (loom-event-name event)
                     "Event set. Waking up %d waiters."
                     waiter-count)))
     ;; 2. Resolve waiters outside the lock to prevent deadlocks if a
     ;;    waiter's callback tries to acquire this or another lock.
     (dolist (promise waiters-to-resolve)
-      (loom:resolve promise resolve-value))))
+      (loom:promise-resolve promise resolve-value))))
 
 ;;;###autoload
 (defun loom:event-clear (event)
@@ -280,7 +280,7 @@ Signals:
       (setf (loom-event-is-set-p event) nil)
       (setf (loom-event-value event) t) ; Reset value to default.
       (setf (loom-event-set-time event) nil)
-      (loom-log :debug (loom-event-name event) "Event cleared."))))
+      (loom:log! :debug (loom-event-name event) "Event cleared."))))
 
 ;;;###autoload
 (defun loom:event-toggle (event &optional value)
@@ -337,7 +337,7 @@ Signals:
         ;; Otherwise, create a new pending promise and queue it.
         (setq wait-promise (loom:promise :name "event-wait"))
         (cl-incf (loom-event-wait-count event))
-        (loom-log :debug (loom-event-name event)
+        (loom:log! :debug (loom-event-name event)
                     "Task is waiting for event.")
         (loom:queue-enqueue (loom-event-wait-queue event) wait-promise)))
     ;; Apply timeout wrapper outside the lock.
@@ -372,13 +372,13 @@ Signals:
         (setq waiters-to-reject (loom:queue-drain
                                  (loom-event-wait-queue event)))
         (setq loom--all-events (delete event loom--all-events))
-        (loom-log :debug (loom-event-name event)
+        (loom:log! :debug (loom-event-name event)
                     "Event destroyed. Rejecting %d waiters."
                     (length waiters-to-reject))))
     ;; Reject waiters outside the lock.
     (dolist (promise waiters-to-reject)
-      (loom:reject promise (list 'loom-event-destroyed-error
-                                 "Event was destroyed" event)))))
+      (loom:promise-reject promise (list 'loom-event-destroyed-error
+                                   "Event was destroyed" event)))))
 
 ;;;###autoload
 (defun loom:event-stats (event)
@@ -478,7 +478,7 @@ Signals:
 (defun loom--event-shutdown-hook ()
   "Clean up all active `loom-event` instances on Emacs shutdown."
   (when loom--all-events
-    (loom-log :info "Global" "Emacs shutdown: Cleaning up %d active event(s)."
+    (loom:log! :info "Global" "Emacs shutdown: Cleaning up %d active event(s)."
               (length loom--all-events))
     ;; Iterate over a copy, as `loom:event-cleanup` modifies the list.
     (dolist (event (copy-sequence loom--all-events))
